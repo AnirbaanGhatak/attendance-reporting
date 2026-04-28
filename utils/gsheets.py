@@ -125,12 +125,12 @@ def fetch_all_employee_names() -> list[str]:
 # Out-office Attendance
 # ─────────────────────────────────────────────────────────────────────────────
 
-def mark_attendance(name: str, latitude: float, longitude: float) -> dict:
+def mark_attendance(name: str, company: str, latitude: float, longitude: float) -> dict:
     today = date.today().isoformat()
     now   = datetime.now().strftime("%H:%M:%S")
     try:
         ws = _get_worksheet(TAB_ATTENDANCE)
-        _ensure_header(ws, ["Name", "Date", "Time", "Latitude", "Longitude"])
+        _ensure_header(ws, ["Name", "Date", "Company", "InTime", "OutTime", "Latitude", "Longitude"])
         for row in ws.get_all_records():
             if (
                 str(row.get("Name", "")).strip().lower() == name.strip().lower()
@@ -138,15 +138,75 @@ def mark_attendance(name: str, latitude: float, longitude: float) -> dict:
             ):
                 return {
                     "success": False,
-                    "message": f"Attendance already marked for {name} on {today}.",
+                    "message": "Already checked in today. Use Check Out instead.",
                 }
-        ws.append_row([name, today, now, latitude, longitude])
+        ws.append_row([name, today, company.strip(), now, "", latitude, longitude])
         return {
             "success": True,
-            "message": f"✅ Attendance marked for {name} on {today} at {now}.",
+            "message": f"✅ Checked in at {now}.",
         }
     except Exception as e:
-        return {"success": False, "message": f"Error writing to sheet: {e}"}
+        return {"success": False, "message": f"Error: {e}"}
+
+
+def mark_checkout(name: str) -> dict:
+    today = date.today().isoformat()
+    now   = datetime.now().strftime("%H:%M:%S")
+    try:
+        ws   = _get_worksheet(TAB_ATTENDANCE)
+        rows = ws.get_all_records()
+        for i, row in enumerate(rows):
+            if (
+                str(row.get("Name", "")).strip().lower() == name.strip().lower()
+                and str(row.get("Date", "")).strip() == today
+            ):
+                if str(row.get("OutTime", "")).strip():
+                    return {
+                        "success": False,
+                        "message": "Already checked out today.",
+                    }
+                # i+2 because gspread is 1-indexed and row 1 is the header
+                out_col = 5   # OutTime is the 5th column
+                ws.update_cell(i + 2, out_col, now)
+                return {
+                    "success": True,
+                    "message": f"✅ Checked out at {now}.",
+                }
+        return {
+            "success": False,
+            "message": "No check-in found for today. Please check in first.",
+        }
+    except Exception as e:
+        return {"success": False, "message": f"Error: {e}"}
+    
+def get_today_status(name: str) -> dict:
+    """
+    Returns the associate's attendance state for today.
+    Possible states: "none" | "checked_in" | "checked_out"
+    """
+    today = date.today().isoformat()
+    try:
+        ws   = _get_worksheet(TAB_ATTENDANCE)
+        rows = ws.get_all_records()
+        for row in rows:
+            if (
+                str(row.get("Name", "")).strip().lower() == name.strip().lower()
+                and str(row.get("Date", "")).strip() == today
+            ):
+                out = str(row.get("OutTime", "")).strip()
+                inn = str(row.get("InTime", "")).strip()
+                return {
+                    "state"   : "checked_out" if out else "checked_in",
+                    "in_time" : inn,
+                    "out_time": out,
+                    "company" : str(row.get("Company", "")).strip(),
+                }
+        return {"state": "none", "in_time": "", "out_time": "", "company": ""}
+    except Exception:
+        return {"state": "none", "in_time": "", "out_time": "", "company": ""}
+    
+
+
 
 
 def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:

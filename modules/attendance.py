@@ -18,6 +18,8 @@ from utils.gsheets import (
     get_associate_names,
     verify_associate,
     mark_attendance,
+    mark_checkout,
+    get_today_status
 )
 
 
@@ -81,19 +83,33 @@ def _show_associate_login():
 def _show_mark_attendance():
     import datetime
 
-    name = st.session_state.user_name
+    name  = st.session_state.user_name
     today = datetime.date.today()
 
-    st.title("📍 Mark Attendance")
+    st.title("📍 Attendance")
     st.markdown(f"**Associate:** {name}")
     st.markdown(f"**Date:** {today.strftime('%A, %d %B %Y')}")
     st.markdown("---")
 
-    # ── Location capture via browser Geolocation API ──────────────────────────
-    st.info("📡 Fetching your location… Please allow location access when prompted.")
+    # Check today's status first
+    status = get_today_status(name)
+    state  = status["state"]
 
-    location = get_geolocation()   # streamlit-js-eval call
+    if state == "checked_out":
+        st.success(
+            f"✅ Attendance complete for today.\n\n"
+            f"**Company:** {status['company']}  \n"
+            f"**In:** {status['in_time']}  |  **Out:** {status['out_time']}"
+        )
+        if st.button("Logout"):
+            logout()
+            st.rerun()
+        return
 
+    # Location (needed for check-in only)
+    if state == "none":
+        st.info("📡 Fetching your location… Allow location access when prompted.")
+    location = get_geolocation()
     lat, lon = None, None
     if location:
         try:
@@ -102,35 +118,68 @@ def _show_mark_attendance():
             acc = location["coords"].get("accuracy", "?")
             st.success(f"📌 Location captured — Lat: `{lat:.5f}`, Lon: `{lon:.5f}` (±{acc:.0f} m)")
         except (KeyError, TypeError):
-            st.warning("Location data incomplete. Please refresh and allow location access.")
-    else:
-        st.warning("Waiting for location… (ensure your browser allows location for this site)")
+            st.warning("Location data incomplete. Refresh and allow location access.")
 
     st.markdown("---")
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        mark_btn = st.button(
-            "✅ Mark Attendance",
-            disabled=(lat is None or lon is None),
-            use_container_width=True,
-            type="primary",
+    # ── CHECK IN ──────────────────────────────────────────────────────────────
+    if state == "none":
+        st.subheader("Check In")
+        company = st.text_input(
+            "Company / Client Office",
+            placeholder="e.g. ABC Pvt. Ltd., Andheri",
         )
-    with col2:
-        if st.button("Logout", use_container_width=True):
-            logout()
-            st.rerun()
 
-    if mark_btn:
-        if lat is None or lon is None:
-            st.error("Cannot mark attendance without a valid location.")
-            return
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            check_in_btn = st.button(
+                "🟢 Check In",
+                disabled=(lat is None or lon is None or not company.strip()),
+                use_container_width=True,
+                type="primary",
+            )
+        with col2:
+            if st.button("Logout", use_container_width=True):
+                logout()
+                st.rerun()
 
-        with st.spinner("Saving attendance…"):
-            result = mark_attendance(name, lat, lon)
+        if not company.strip():
+            st.caption("Enter the company name to enable Check In.")
 
-        if result["success"]:
-            st.balloons()
-            st.success(result["message"])
-        else:
-            st.error(result["message"])
+        if check_in_btn:
+            with st.spinner("Saving…"):
+                result = mark_attendance(name, company, lat, lon)
+            if result["success"]:
+                st.success(result["message"])
+                st.rerun()
+            else:
+                st.error(result["message"])
+
+    # ── CHECK OUT ─────────────────────────────────────────────────────────────
+    elif state == "checked_in":
+        st.info(
+            f"**Checked in** at **{status['in_time']}**  \n"
+            f"**Company:** {status['company']}"
+        )
+        st.subheader("Check Out")
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            check_out_btn = st.button(
+                "🔴 Check Out",
+                use_container_width=True,
+                type="primary",
+            )
+        with col2:
+            if st.button("Logout", use_container_width=True):
+                logout()
+                st.rerun()
+
+        if check_out_btn:
+            with st.spinner("Saving…"):
+                result = mark_checkout(name)
+            if result["success"]:
+                st.success(result["message"])
+                st.rerun()
+            else:
+                st.error(result["message"])

@@ -904,8 +904,9 @@ def _show_user_management():
     with st.form("add_user_form"):
         new_name  = st.text_input("Full Name", placeholder="e.g. Aparna Pradyot Maitra")
         new_pin   = st.text_input("3-Digit PIN", type="password",
-                                  max_chars=3, placeholder="• • •")
-        submitted = st.form_submit_button("Add Associate", use_container_width=True)
+                              max_chars=3, placeholder="• • •")
+        new_role  = st.selectbox("Role", options=["associate", "admin"])
+        submitted = st.form_submit_button("Add User", use_container_width=True)
 
     if submitted:
         if not new_name.strip():
@@ -914,22 +915,20 @@ def _show_user_management():
             st.error("PIN must be exactly 3 digits (numbers only).")
         else:
             try:
-                add_user(new_name.strip(), new_pin.strip(), role="associate")
-                st.success(f"✅ '{new_name.strip()}' added successfully.")
+                add_user(new_name.strip(), new_pin.strip(), role=new_role)
+                st.success(f"✅ '{new_name.strip()}' added as {new_role}.")
             except Exception as e:
                 st.error(f"Error: {e}")
 
     st.markdown("---")
-    st.subheader("Current Associates")
+    st.subheader("Current Users")
     try:
-        users      = fetch_users()
-        associates = users[
-            users["role"].str.strip().str.lower() == "associate"
-        ][["name"]].copy()
-        associates.columns = ["Name"]
-        if associates.empty:
-            st.info("No associates added yet.")
+        users = fetch_users()
+        if users.empty:
+            st.info("No users added yet.")
         else:
-            st.dataframe(associates.reset_index(drop=True), use_container_width=True)
+            display = users[["name", "role"]].copy()
+            display.columns = ["Name", "Role"]
+            st.dataframe(display.reset_index(drop=True), use_container_width=True)
     except Exception as e:
-        st.error(f"Could not load users: {e}")
+        st.error(f"Could not load users: {e}")  
