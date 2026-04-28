@@ -3,54 +3,62 @@ modules/admin.py
 ────────────────
 Module 2 – Admin Dashboard
 
-Phase A  Attendance Consolidation
-  Upload one or more in-office XLS files (one per employee, exported from your
-  existing attendance system) + pull out-office records from GSheets.
-  Merge them into a final monthly report → download as CSV.
-
-Phase B  Salary Calculation & Splitting
-  Select employee → base salary → bank → dynamic split rows → save to GSheet
+Sidebar pages:
+  📊 Attendance Report   – upload XLS files → merged monthly report → CSV
+  💰 Salary Processing   – full salary calculation with leave ledger
+  👥 Manage Users        – add / view associates
 
 ─────────────────────────────────────────────────────────────────────────────
-ACTUAL XLS FILE FORMAT (reverse-engineered from the uploaded sample):
+SALARY CALCULATION LOGIC
 ─────────────────────────────────────────────────────────────────────────────
-  Sheet: DailyAttendance_SummaryReport   (single sheet, no real column headers)
 
-  Row index 0   : blank
-  Row index 1   : title  "Daily Attendance Report (Summary Report)"
-  Row index 2   : blank
-  Row index 3   : date range  e.g. "Apr 01 2026  To  Apr 30 2026"
-  Row index 4   : Company info
-  Row index 5-6 : blank
-  Row index 7   : Department row
-  Row index 8   : "Employee Code: ... Employee Name: APARNA PRADYOT MAITRA"
-                    col[3] = employee code,  col[7] = employee name
-  Row index 9   : column labels (Date / InTime / OutTime / Shift / Total Duration / Status / Remarks)
-  Row index 10+ : daily data rows
-  Last row      : summary string e.g. "Total Duration=83 Hrs 6 Min , PresentDays=16 ..."
+Every month per employee:
 
-  Useful columns in data rows (0-indexed):
-    col 1  -> Date           e.g. "01-Apr-2026"
-    col 3  -> InTime         e.g. "11:54"
-    col 4  -> OutTime        e.g. "17:21"
-    col 6  -> Shift          e.g. "GS"
-    col 7  -> Total Duration e.g. "5:27"
-    col 8  -> Status         Present | halfPresent | Absent | WeeklyOff |
-                             Absent (No OutPunch)
-    col 10 -> Remarks
+  ADD_SUBSTRACT = B_Forward + CL_PL + Sunday_C_Off − Leave_Availed
 
-  Status -> Days_Count mapping:
-    Present                -> 1.0
-    halfPresent (with ½)   -> 0.5
-    Absent                 -> 0.0
-    WeeklyOff              -> 0.0
-    Absent (No OutPunch)   -> 0.0
+  Study Leave month:
+    → CL_PL = 0, Sunday_C_Off = 0, Leave_Availed = 0
+    → Salary_Paid = 0, Deduction = 0
+    → C_Forward = B_Forward  (balance just carries through untouched)
+
+  Normal month, ADD_SUBSTRACT >= 0:
+    → No deduction, Salary_Paid = Base_Salary
+    → C_Forward = ADD_SUBSTRACT
+
+  Normal month, ADD_SUBSTRACT < 0:
+    → Deduction = Base_Salary / days_in_month × |ADD_SUBSTRACT|
+    → Salary_Paid = Base_Salary − Deduction
+    → C_Forward = 0
+
+Fixed public holidays (employee gets day off; if they worked → earns comp off):
+  26-Jan, 03-Mar, 19-Mar, 01-May, 15-Aug, 14-Sep, 20-Oct,
+  09-Nov, 10-Nov, 11-Nov, 25-Dec
+
+Sunday/C_Off is auto-calculated from the attendance XLS:
+  Count rows where status is Present/½Present AND date is a Sunday
+  or one of the fixed holidays above.
+  Admin can then add an Extra Holiday Adjustment (± days) on top.
+
+Leave_Availed is auto-calculated from attendance XLS:
+  Absent              → 1.0 day
+  Absent(No OutPunch) → 1.0 day
+  ½Present            → 0.5 day
+  All other statuses  → 0.0
+
+XLS FILE FORMAT (your attendance system export):
+  Row 0-7: headers/metadata
+  Row 8:   employee name at col index 7
+  Row 9:   column labels
+  Row 10+: daily data (col 1=Date, 3=InTime, 4=OutTime, 6=Shift,
+                        7=TotalDuration, 8=Status)
+  Last row: summary text (skipped)
 """
 
 from __future__ import annotations
 
+import calendar
 import io
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
 import streamlit as st
@@ -58,7 +66,11 @@ import streamlit as st
 from utils.auth import logout, verify_admin
 from utils.gsheets import (
     fetch_out_office_attendance,
-    save_salary_record,
+    save_salary_ledger_row,
+    save_salary_splits,
+    fetch_carry_forward,
+    ledger_month_exists,
+    fetch_salary_ledger,
     fetch_all_employee_names,
     add_user,
     fetch_users,
@@ -66,18 +78,43 @@ from utils.gsheets import (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# XLS Parser — understands the actual file format
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fixed public holidays as (month, day) tuples — year-agnostic
+FIXED_HOLIDAYS: set[tuple[int, int]] = {
+    (1, 26),   # Republic Day
+    (3, 3),    # (company holiday)
+    (3, 19),   # (company holiday)
+    (5, 1),    # Labour Day
+    (8, 15),   # Independence Day
+    (9, 14),   # (company holiday)
+    (10, 20),  # Diwali
+    (11, 9),   # Diwali holiday
+    (11, 10),  # Diwali holiday
+    (11, 11),  # Diwali holiday
+    (12, 25),  # Christmas
+}
+
+
+def _is_holiday(d: date) -> bool:
+    """Return True if the date is a Sunday or a fixed public holiday."""
+    return d.weekday() == 6 or (d.month, d.day) in FIXED_HOLIDAYS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XLS Parser
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_attendance_xls(file_obj) -> pd.DataFrame | None:
     """
-    Parse one XLS file exported from the existing attendance system.
+    Parse one XLS file from the attendance machine.
 
-    Returns a DataFrame with columns:
+    Returns DataFrame with columns:
         Employee_Name | Date (YYYY-MM-DD) | InTime | OutTime | Shift |
         Total_Duration | Status | Days_Count | Source
 
-    Returns None and calls st.error() on failure.
+    Returns None (and shows st.error) on any failure.
     """
     try:
         raw = pd.read_excel(file_obj, sheet_name=0, header=None, engine="xlrd")
@@ -85,7 +122,7 @@ def _parse_attendance_xls(file_obj) -> pd.DataFrame | None:
         st.error(f"Could not read file: {e}")
         return None
 
-    # ── Extract employee name from row 8, column 7 ────────────────────────────
+    # ── Employee name: row 8, col 7 ───────────────────────────────────────────
     employee_name = ""
     try:
         val = str(raw.iloc[8, 7]).strip()
@@ -95,67 +132,49 @@ def _parse_attendance_xls(file_obj) -> pd.DataFrame | None:
         pass
 
     if not employee_name:
-        # Fallback: scan row 8 for any non-null value after column 6
-        try:
-            for col_idx in range(7, raw.shape[1]):
-                val = str(raw.iloc[8, col_idx]).strip()
-                if val and val.lower() != "nan":
-                    employee_name = val
-                    break
-        except Exception:
-            pass
+        for col_idx in range(7, raw.shape[1]):
+            val = str(raw.iloc[8, col_idx]).strip()
+            if val and val.lower() != "nan":
+                employee_name = val
+                break
 
     if not employee_name:
-        st.error("Could not find the employee name in this file (expected row 9, col 8).")
+        st.error("Could not find employee name in this file (expected row 9, col 8).")
         return None
 
-    # ── Locate data rows ──────────────────────────────────────────────────────
-    # Row 9 = column-label row, Row 10 onwards = data, last row = summary text
-    data_start = 10
-    data_end   = len(raw) - 1     # drop summary row
-
+    # ── Data rows: index 10 → second-to-last ──────────────────────────────────
+    data_start, data_end = 10, len(raw) - 1
     if data_end <= data_start:
         st.error(f"Not enough data rows in file for {employee_name}.")
         return None
 
     data = raw.iloc[data_start:data_end].reset_index(drop=True)
 
-    # ── Map positional columns to named columns ───────────────────────────────
     col_map = {
-        1: "Date",
-        3: "InTime",
-        4: "OutTime",
-        6: "Shift",
-        7: "Total_Duration",
-        8: "Status",
+        1: "Date", 3: "InTime", 4: "OutTime",
+        6: "Shift", 7: "Total_Duration", 8: "Status",
     }
     df = pd.DataFrame()
     for pos, name in col_map.items():
-        if pos < data.shape[1]:
-            df[name] = data.iloc[:, pos].astype(str).str.strip()
-        else:
-            df[name] = ""
+        df[name] = data.iloc[:, pos].astype(str).str.strip() if pos < data.shape[1] else ""
 
-    # ── Keep only rows where Date looks like "DD-Mon-YYYY" ────────────────────
+    # ── Keep only valid date rows ─────────────────────────────────────────────
     df = df[df["Date"].str.match(r"^\d{2}-[A-Za-z]{3}-\d{4}$", na=False)].copy()
-
     if df.empty:
         st.error(f"No valid date rows found for {employee_name}.")
         return None
 
-    # ── Parse dates to YYYY-MM-DD ─────────────────────────────────────────────
     df["Date"] = (
         pd.to_datetime(df["Date"], format="%d-%b-%Y", errors="coerce")
         .dt.strftime("%Y-%m-%d")
     )
     df = df.dropna(subset=["Date"])
 
-    # ── Days_Count from Status ─────────────────────────────────────────────────
+    # ── Days_Count ────────────────────────────────────────────────────────────
     def _days_count(status: str) -> float:
         s = status.strip().lower()
         if s == "present":
             return 1.0
-        # handles "½present", "1/2present", "halfpresent", etc.
         if "\u00bdpresent" in s or "half" in s or "1/2" in s:
             return 0.5
         return 0.0   # Absent, WeeklyOff, Absent (No OutPunch)
@@ -168,6 +187,96 @@ def _parse_attendance_xls(file_obj) -> pd.DataFrame | None:
         "Employee_Name", "Date", "InTime", "OutTime",
         "Shift", "Total_Duration", "Status", "Days_Count", "Source",
     ]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Salary calculation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _auto_leave_availed(df: pd.DataFrame) -> float:
+    """
+    Count leave days from parsed attendance rows for one employee/month.
+
+    Absent / Absent(No OutPunch) → 1.0 each
+    ½Present                     → 0.5 each
+    Everything else              → 0.0
+    """
+    total = 0.0
+    for _, row in df.iterrows():
+        s = str(row["Status"]).strip().lower()
+        if "absent" in s:
+            total += 1.0
+        elif "\u00bdpresent" in s or "half" in s or "1/2" in s:
+            total += 0.5
+    return total
+
+
+def _auto_sunday_c_off(df: pd.DataFrame, extra_adjustment: float = 0.0) -> float:
+    """
+    Count days where the employee was Present on a Sunday or fixed holiday
+    (i.e. they earned a compensatory off).
+    Then add the admin's manual extra_adjustment.
+    """
+    total = 0.0
+    for _, row in df.iterrows():
+        s = str(row["Status"]).strip().lower()
+        worked = s == "present" or "\u00bdpresent" in s or "1/2" in s or "half" in s
+        if not worked:
+            continue
+        try:
+            d = date.fromisoformat(str(row["Date"]))
+            if _is_holiday(d):
+                total += 1.0 if s == "present" else 0.5
+        except ValueError:
+            continue
+    return max(0.0, total + extra_adjustment)
+
+
+def _calculate_salary(
+    b_forward: float,
+    cl_pl: float,
+    sunday_c_off: float,
+    leave_availed: float,
+    base_salary: float,
+    days_in_month: int,
+    is_study_leave: bool,
+) -> dict:
+    """
+    Core salary formula. Returns a dict with all derived values.
+    """
+    if is_study_leave:
+        return {
+            "b_forward"     : b_forward,
+            "cl_pl"         : 0.0,
+            "sunday_c_off"  : 0.0,
+            "leave_availed" : 0.0,
+            "add_substract" : b_forward,   # balance just passes through
+            "c_forward"     : b_forward,
+            "deduction"     : 0.0,
+            "salary_paid"   : 0.0,
+        }
+
+    add_substract = b_forward + cl_pl + sunday_c_off - leave_availed
+
+    if add_substract >= 0:
+        c_forward   = add_substract
+        deduction   = 0.0
+        salary_paid = base_salary
+    else:
+        c_forward   = 0.0
+        deduction   = (base_salary / days_in_month) * abs(add_substract)
+        salary_paid = base_salary - deduction
+
+    return {
+        "b_forward"     : b_forward,
+        "cl_pl"         : cl_pl,
+        "sunday_c_off"  : sunday_c_off,
+        "leave_availed" : leave_availed,
+        "add_substract" : add_substract,
+        "c_forward"     : c_forward,
+        "deduction"     : deduction,
+        "salary_paid"   : salary_paid,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,12 +314,10 @@ def show_admin_module():
 def _show_admin_login():
     st.title("🔐 Admin Login")
     st.markdown("---")
-
     with st.form("admin_login_form"):
         username  = st.text_input("Username")
         password  = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login", use_container_width=True)
-
     if submitted:
         if verify_admin(username, password):
             st.session_state.logged_in = True
@@ -229,65 +336,49 @@ def _show_admin_login():
 def _show_attendance_consolidation():
     st.title("📊 Monthly Attendance Report")
     st.caption(
-        "Upload one .xls file per employee (Daily Attendance Summary Report "
-        "exported from your attendance machine). "
-        "The app reads the employee name from inside each file automatically."
+        "Upload one .xls per employee from your attendance machine. "
+        "The employee name is read from inside the file automatically."
     )
     st.markdown("---")
 
-    # ── Month selector ────────────────────────────────────────────────────────
     col1, col2 = st.columns(2)
     with col1:
         year_opts = list(range(2024, datetime.now().year + 2))
-        year = st.selectbox(
-            "Year", options=year_opts,
-            index=year_opts.index(datetime.now().year)
-        )
+        year = st.selectbox("Year", options=year_opts,
+                            index=year_opts.index(datetime.now().year))
     with col2:
         month_num = st.selectbox(
-            "Month",
-            options=list(range(1, 13)),
+            "Month", options=list(range(1, 13)),
             format_func=lambda m: datetime(2000, m, 1).strftime("%B"),
             index=datetime.now().month - 1,
         )
-    month_str  = f"{year}-{month_num:02d}"
+    month_str   = f"{year}-{month_num:02d}"
     month_label = datetime(year, month_num, 1).strftime("%B %Y")
     st.markdown("---")
 
-    # ── Multi-file upload ─────────────────────────────────────────────────────
     st.subheader("Step 1 — Upload Attendance Files")
     uploaded_files = st.file_uploader(
-        "Upload one XLS file per employee",
-        type=["xls"],
-        accept_multiple_files=True,
+        "Upload XLS files (one per employee)",
+        type=["xls"], accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
     in_office_frames: list[pd.DataFrame] = []
-
     if uploaded_files:
         st.write(f"**{len(uploaded_files)} file(s) uploaded — parsing…**")
-
         for uf in uploaded_files:
             parsed = _parse_attendance_xls(uf)
             if parsed is None:
-                continue   # error already shown by _parse_attendance_xls
-
-            month_rows = parsed[parsed["Date"].str.startswith(month_str, na=False)]
-
-            if month_rows.empty:
-                st.warning(
-                    f"⚠️  `{uf.name}` — no rows found for {month_label}. "
-                    f"Check that you selected the correct month above."
-                )
                 continue
-
-            emp_name     = month_rows["Employee_Name"].iloc[0]
-            present_days = month_rows["Days_Count"].sum()
+            month_rows = parsed[parsed["Date"].str.startswith(month_str, na=False)]
+            if month_rows.empty:
+                st.warning(f"⚠️ `{uf.name}` — no rows for {month_label}. Skipped.")
+                continue
+            emp_name      = month_rows["Employee_Name"].iloc[0]
+            working_days  = month_rows["Days_Count"].sum()
             st.success(
-                f"✅  `{uf.name}` → **{emp_name}**  |  "
-                f"{len(month_rows)} calendar days  |  "
-                f"**{present_days:.1f} working days**"
+                f"✅ `{uf.name}` → **{emp_name}**  |  "
+                f"{len(month_rows)} calendar days  |  **{working_days:.1f} working days**"
             )
             in_office_frames.append(month_rows)
 
@@ -296,23 +387,17 @@ def _show_attendance_consolidation():
         if in_office_frames else pd.DataFrame()
     )
 
-    # ── Generate report ───────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("Step 2 — Merge with Out-Office Records")
-    st.caption(
-        "Clicking the button below fetches out-office attendance from Google Sheets "
-        "and combines it with the files uploaded above."
-    )
 
     if st.button("🔄 Generate Report", type="primary", use_container_width=True):
         with st.spinner("Fetching out-office data from Google Sheets…"):
             out_df = fetch_out_office_attendance(month=month_str)
 
         if out_df.empty and in_office_df.empty:
-            st.warning("No data found for the selected month in either source.")
+            st.warning("No data found for the selected month.")
             return
 
-        # ── Shape out-office data to match in-office columns ──────────────────
         out_df_proc = pd.DataFrame()
         if not out_df.empty:
             out_df_proc = pd.DataFrame({
@@ -327,72 +412,71 @@ def _show_attendance_consolidation():
                 "Source"        : "Out-Office",
             })
 
-        # ── Combine & sort ─────────────────────────────────────────────────────
-        frames  = [f for f in [in_office_df, out_df_proc] if not f.empty]
+        frames   = [f for f in [in_office_df, out_df_proc] if not f.empty]
         combined = pd.concat(frames, ignore_index=True)
         combined = combined.sort_values(["Employee_Name", "Date"]).reset_index(drop=True)
 
-        # ── Per-employee summary ───────────────────────────────────────────────
         summary_rows = []
         for emp, grp in combined.groupby("Employee_Name"):
             present    = int((grp["Days_Count"] == 1.0).sum())
             half       = int((grp["Days_Count"] == 0.5).sum())
-            weekly_off = int(grp["Status"].str.lower().str.contains("weeklyoff", na=False).sum())
-            absent     = int((grp["Days_Count"] == 0.0).sum()) - weekly_off
-            total      = grp["Days_Count"].sum()
+            weekly_off = int(
+                grp["Status"].str.lower().str.contains("weeklyoff", na=False).sum()
+            )
+            absent = int((grp["Days_Count"] == 0.0).sum()) - weekly_off
             summary_rows.append({
-                "Employee"          : emp,
-                "Present Days"      : present,
-                "Half Days"         : half,
-                "Absent Days"       : max(absent, 0),
-                "Weekly Off"        : weekly_off,
-                "Total Working Days": total,
+                "Employee"           : emp,
+                "Present Days"       : present,
+                "Half Days"          : half,
+                "Absent Days"        : max(absent, 0),
+                "Weekly Off"         : weekly_off,
+                "Total Working Days" : grp["Days_Count"].sum(),
             })
         summary = pd.DataFrame(summary_rows)
 
-        # ── Show ──────────────────────────────────────────────────────────────
         st.markdown(f"#### Detail — {month_label}")
         st.dataframe(combined, use_container_width=True)
-
         st.markdown("#### Summary")
         st.dataframe(summary, use_container_width=True)
 
-        # ── Download buttons ──────────────────────────────────────────────────
         col_a, col_b = st.columns(2)
         with col_a:
-            buf1 = io.StringIO()
-            combined.to_csv(buf1, index=False)
-            st.download_button(
-                "⬇️ Full Report (CSV)",
-                data=buf1.getvalue(),
-                file_name=f"attendance_detail_{month_str}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            buf = io.StringIO()
+            combined.to_csv(buf, index=False)
+            st.download_button("⬇️ Full Report (CSV)", buf.getvalue(),
+                               f"attendance_detail_{month_str}.csv", "text/csv",
+                               use_container_width=True)
         with col_b:
-            buf2 = io.StringIO()
-            summary.to_csv(buf2, index=False)
-            st.download_button(
-                "⬇️ Summary (CSV)",
-                data=buf2.getvalue(),
-                file_name=f"attendance_summary_{month_str}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            buf = io.StringIO()
+            summary.to_csv(buf, index=False)
+            st.download_button("⬇️ Summary (CSV)", buf.getvalue(),
+                               f"attendance_summary_{month_str}.csv", "text/csv",
+                               use_container_width=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase B – Salary Calculation & Splitting
+# Phase B – Salary Processing
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _show_salary_processing():
     st.title("💰 Salary Processing")
+    st.markdown(
+        "Upload the attendance XLS for an employee, review the auto-calculated "
+        "values, adjust if needed, then save to the ledger."
+    )
     st.markdown("---")
 
-    if "split_count" not in st.session_state:
-        st.session_state.split_count = 0
+    # ── Session state init ────────────────────────────────────────────────────
+    for key, default in [
+        ("sal_split_count", 0),
+        ("sal_calc_result", None),   # stores last calculation dict
+        ("sal_xls_df", None),        # parsed attendance rows for selected month
+        ("sal_xls_employee", ""),    # employee name read from XLS
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
-    # ── Employee / month ──────────────────────────────────────────────────────
+    # ── Employee + month ──────────────────────────────────────────────────────
     employee_names = fetch_all_employee_names()
     if not employee_names:
         st.warning("No associates found. Add them via Manage Users first.")
@@ -400,87 +484,317 @@ def _show_salary_processing():
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        employee = st.selectbox("Employee", options=employee_names)
+        employee = st.selectbox("Employee", options=employee_names, key="sal_employee")
     with col2:
         year_opts = list(range(2024, datetime.now().year + 2))
-        sal_year  = st.selectbox(
-            "Year", options=year_opts,
-            index=year_opts.index(datetime.now().year),
-            key="sal_year",
-        )
+        sal_year  = st.selectbox("Year", options=year_opts,
+                                 index=year_opts.index(datetime.now().year),
+                                 key="sal_year")
     with col3:
         sal_month = st.selectbox(
-            "Month",
-            options=list(range(1, 13)),
+            "Month", options=list(range(1, 13)),
             format_func=lambda m: datetime(2000, m, 1).strftime("%B"),
             index=datetime.now().month - 1,
             key="sal_month",
         )
-    month_str = f"{sal_year}-{sal_month:02d}"
 
-    # ── Salary + bank ─────────────────────────────────────────────────────────
-    col4, col5 = st.columns(2)
-    with col4:
-        base_salary = st.number_input(
-            "Base Salary (₹)", min_value=0.0, step=500.0, value=0.0, format="%.2f"
+    month_str   = f"{sal_year}-{sal_month:02d}"
+    month_label = datetime(sal_year, sal_month, 1).strftime("%B %Y")
+    days_in_month = calendar.monthrange(sal_year, sal_month)[1]
+
+    # ── Duplicate warning ─────────────────────────────────────────────────────
+    if ledger_month_exists(employee, month_str):
+        st.warning(
+            f"⚠️ A ledger record already exists for **{employee}** in **{month_label}**. "
+            "Saving again will be blocked. Delete the existing row from the sheet to re-process."
         )
-    with col5:
-        try:
-            bank_options = list(st.secrets["banks"]["accounts"])
-        except Exception:
-            bank_options = ["Bank Account 1", "Bank Account 2"]
-        bank = st.selectbox("Pay From (Bank Account)", options=bank_options)
 
     st.markdown("---")
 
-    # ── Split mechanism ───────────────────────────────────────────────────────
-    st.subheader("Salary Split")
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Upload attendance XLS
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("1 — Upload Attendance File")
+    st.caption("Upload the XLS for this employee. The system auto-calculates Leave Availed and Sunday/C Off.")
+
+    uploaded = st.file_uploader(
+        "Upload XLS", type=["xls"], key="sal_xls_upload",
+        label_visibility="collapsed",
+    )
+
+    month_df = pd.DataFrame()    # rows for selected month only
+    auto_leave_availed  = 0.0
+    auto_sunday_c_off   = 0.0
+    xls_employee_name   = ""
+
+    if uploaded:
+        parsed = _parse_attendance_xls(uploaded)
+        if parsed is not None:
+            xls_employee_name = parsed["Employee_Name"].iloc[0]
+            month_df = parsed[parsed["Date"].str.startswith(month_str, na=False)].copy()
+
+            if month_df.empty:
+                st.warning(
+                    f"No rows found for {month_label} in this file. "
+                    "Check that you selected the right month above."
+                )
+            else:
+                auto_leave_availed = _auto_leave_availed(month_df)
+                auto_sunday_c_off  = _auto_sunday_c_off(month_df)
+
+                st.success(
+                    f"✅ **{xls_employee_name}** — {len(month_df)} calendar days found  |  "
+                    f"Auto Leave Availed: **{auto_leave_availed}**  |  "
+                    f"Auto Sunday/C Off: **{auto_sunday_c_off}**"
+                )
+
+                with st.expander("View raw attendance rows for this month"):
+                    st.dataframe(
+                        month_df[["Date", "InTime", "OutTime", "Status", "Days_Count"]],
+                        use_container_width=True,
+                    )
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Study Leave toggle
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("2 — Study Leave")
+    is_study_leave = st.toggle(
+        "This is a Study Leave month (no salary paid, no CL/PL accrual, balance carries through)",
+        value=False,
+        key="sal_study_leave",
+    )
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Leave parameters (editable, auto-filled from XLS)
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("3 — Leave Parameters")
+
+    if is_study_leave:
+        st.info(
+            "Study Leave month — all leave fields are zeroed out automatically. "
+            "Only B/Forward carries through."
+        )
+
+    # B/Forward: auto-loaded from ledger
+    b_forward_auto = fetch_carry_forward(employee, month_str)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        b_forward = st.number_input(
+            "B/Forward (auto-loaded from previous month)",
+            value=float(b_forward_auto),
+            step=0.5,
+            format="%.1f",
+            disabled=is_study_leave,
+            key="sal_b_forward",
+            help="Carry-forward from the last saved month. Edit only if correcting an error.",
+        )
+    with col_b:
+        cl_pl = st.number_input(
+            "CL/PL Eligible (always 1.5)",
+            value=0.0 if is_study_leave else 1.5,
+            step=0.5,
+            format="%.1f",
+            disabled=True,
+            key="sal_cl_pl",
+        )
+
+    col_c, col_d, col_e = st.columns(3)
+    with col_c:
+        sunday_c_off_base = st.number_input(
+            "Sunday/C Off (auto from XLS)",
+            value=0.0 if is_study_leave else float(auto_sunday_c_off),
+            step=0.5,
+            format="%.1f",
+            disabled=is_study_leave,
+            key="sal_sc_off_base",
+            help="Days the employee worked on a Sunday or fixed public holiday.",
+        )
+    with col_d:
+        extra_adj = st.number_input(
+            "Extra Holiday Adjustment (±)",
+            value=0.0,
+            step=0.5,
+            format="%.1f",
+            disabled=is_study_leave,
+            key="sal_extra_adj",
+            help=(
+                "Use this to add or remove comp-off days for extra declared holidays "
+                "not in the standard list. E.g. +1 if a surprise holiday was given."
+            ),
+        )
+    with col_e:
+        sunday_c_off_final = max(0.0, sunday_c_off_base + extra_adj) if not is_study_leave else 0.0
+        st.number_input(
+            "Final Sunday/C Off",
+            value=sunday_c_off_final,
+            disabled=True,
+            format="%.1f",
+            key="sal_sc_off_final",
+        )
+
+    leave_availed = st.number_input(
+        "Leave Availed (auto from XLS — edit if needed)",
+        value=0.0 if is_study_leave else float(auto_leave_availed),
+        step=0.5,
+        min_value=0.0,
+        format="%.1f",
+        disabled=is_study_leave,
+        key="sal_leave_availed",
+        help=(
+            "Absent = 1 day, Absent(No OutPunch) = 1 day, ½Present = 0.5 day. "
+            "Edit if the raw count needs a manual correction."
+        ),
+    )
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 4 — Salary & Bank
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("4 — Salary & Bank")
+
+    col_f, col_g = st.columns(2)
+    with col_f:
+        base_salary = st.number_input(
+            "Base Salary (₹)", min_value=0.0, step=500.0,
+            value=0.0, format="%.2f", key="sal_base",
+        )
+    with col_g:
+        try:
+            bank_options = list(st.secrets["banks"]["accounts"])
+        except Exception:
+            bank_options = ["FF/JSB", "M&RFSPL/UBI", "PTBS/UBI", "MCH", "AUSM/HDFC"]
+        bank = st.selectbox("Pay From (Entity/Bank)", options=bank_options, key="sal_bank")
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 5 — Live Calculation Preview
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("5 — Calculation Preview")
+    st.caption(f"Month has **{days_in_month} days**. Formula: Salary ÷ {days_in_month} × |deductible days|")
+
+    if base_salary > 0:
+        result = _calculate_salary(
+            b_forward      = b_forward,
+            cl_pl          = 0.0 if is_study_leave else cl_pl,
+            sunday_c_off   = sunday_c_off_final,
+            leave_availed  = leave_availed,
+            base_salary    = base_salary,
+            days_in_month  = days_in_month,
+            is_study_leave = is_study_leave,
+        )
+
+        # ── Display the ledger row as a clean table ───────────────────────────
+        preview_data = {
+            "Field": [
+                "B/Forward (in)",
+                "CL/PL Eligible",
+                "Sunday/C Off",
+                "Leave Availed",
+                "ADD/SUBSTRACT",
+                "C/Forward (out)",
+                "Base Salary",
+                "Deduction",
+                "Salary Paid",
+            ],
+            "Value": [
+                f"{result['b_forward']:.1f} days",
+                f"{result['cl_pl']:.1f} days",
+                f"{result['sunday_c_off']:.1f} days",
+                f"{result['leave_availed']:.1f} days",
+                f"{result['add_substract']:.1f} days",
+                f"{result['c_forward']:.1f} days",
+                f"₹{base_salary:,.2f}",
+                f"₹{result['deduction']:,.2f}",
+                f"₹{result['salary_paid']:,.2f}",
+            ],
+        }
+        preview_df = pd.DataFrame(preview_data)
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+        # Colour-coded verdict
+        if is_study_leave:
+            st.info("📚 Study Leave — no salary paid this month. Balance carries through.")
+        elif result["add_substract"] >= 0:
+            st.success(
+                f"✅ No deduction — **{result['add_substract']:.1f} days** carry forward next month."
+            )
+        else:
+            st.error(
+                f"⚠️ Deduction of **₹{result['deduction']:,.2f}** applied. "
+                f"({base_salary:,.0f} ÷ {days_in_month} × {abs(result['add_substract']):.1f})"
+            )
+
+        # Deduction formula shown explicitly
+        if not is_study_leave and result["add_substract"] < 0:
+            st.caption(
+                f"Formula: ₹{base_salary:,.0f} ÷ {days_in_month} × "
+                f"{abs(result['add_substract']):.1f} = ₹{result['deduction']:,.2f}"
+            )
+
+        st.session_state.sal_calc_result = result
+
+    else:
+        st.info("Enter a base salary above to see the calculation preview.")
+        st.session_state.sal_calc_result = None
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 6 — Salary Split
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("6 — Salary Split")
     st.caption(
-        "Press **Split** to add a recipient row — you can press it as many times as needed. "
-        "Leave this section empty to save the full amount to the employee directly."
+        "If the salary is paid to multiple recipients, press **Split** for each one. "
+        "Leave empty to record the full salary directly to the employee."
     )
 
     btn1, btn2 = st.columns([1, 1])
     with btn1:
         if st.button("➕ Split", use_container_width=True):
-            st.session_state.split_count += 1
+            st.session_state.sal_split_count += 1
     with btn2:
-        if st.session_state.split_count > 0:
+        if st.session_state.sal_split_count > 0:
             if st.button("🗑️ Clear All Splits", use_container_width=True):
-                st.session_state.split_count = 0
+                st.session_state.sal_split_count = 0
                 st.rerun()
 
-    # ── Render split rows ─────────────────────────────────────────────────────
     splits: list[dict] = []
     running_total = 0.0
 
-    if st.session_state.split_count > 0:
+    if st.session_state.sal_split_count > 0:
         hc = st.columns([3, 2])
         hc[0].markdown("**Recipient Name**")
         hc[1].markdown("**Amount (₹)**")
 
-        for i in range(st.session_state.split_count):
+        for i in range(st.session_state.sal_split_count):
             rc = st.columns([3, 2])
             with rc[0]:
                 rec_name = st.text_input(
-                    f"name_{i}", key=f"split_name_{i}",
+                    f"n{i}", key=f"sp_name_{i}",
                     label_visibility="collapsed",
                     placeholder=f"Recipient {i + 1}",
                 )
             with rc[1]:
                 rec_amount = st.number_input(
-                    f"amt_{i}", key=f"split_amount_{i}",
+                    f"a{i}", key=f"sp_amt_{i}",
                     label_visibility="collapsed",
                     min_value=0.0, step=100.0, format="%.2f",
                 )
             splits.append({"name": rec_name, "amount": rec_amount})
             running_total += rec_amount
 
-        # Balance indicator
-        if base_salary > 0:
-            diff = base_salary - running_total
+        if base_salary > 0 and st.session_state.sal_calc_result:
+            salary_paid = st.session_state.sal_calc_result["salary_paid"]
+            diff = salary_paid - running_total
             if abs(diff) < 0.01:
-                st.success(f"✅ Split total ₹{running_total:,.2f} matches base salary.")
+                st.success(f"✅ Split total ₹{running_total:,.2f} matches Salary Paid.")
             elif diff > 0:
                 st.warning(f"⚠️ Unallocated: ₹{diff:,.2f}")
             else:
@@ -488,32 +802,93 @@ def _show_salary_processing():
 
     st.markdown("---")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    if st.button("💾 Save to Sheet", type="primary", use_container_width=True):
-        if base_salary <= 0:
-            st.error("Enter a base salary greater than 0.")
-            return
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 7 — Save
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("7 — Save to Google Sheets")
 
-        invalid = [s for s in splits if not s["name"].strip() or s["amount"] <= 0]
-        if invalid:
-            st.error("Each split row must have a recipient name and an amount > 0.")
-            return
+    if st.button("💾 Save Salary Record", type="primary", use_container_width=True):
+
+        # Validations
+        if base_salary <= 0:
+            st.error("Enter a base salary > 0 before saving.")
+            st.stop()
+
+        if st.session_state.sal_calc_result is None:
+            st.error("Calculation result is missing. Check your inputs.")
+            st.stop()
+
+        invalid_splits = [s for s in splits if not s["name"].strip() or s["amount"] <= 0]
+        if invalid_splits:
+            st.error("Each split row needs a recipient name and amount > 0.")
+            st.stop()
+
+        result = st.session_state.sal_calc_result
 
         with st.spinner("Saving to Google Sheets…"):
-            result = save_salary_record(
-                employee=employee,
-                month=month_str,
-                base_salary=base_salary,
-                bank=bank,
-                splits=splits,
+            # 1. Save main ledger row
+            ledger_result = save_salary_ledger_row(
+                employee       = employee,
+                month          = month_str,
+                b_forward      = result["b_forward"],
+                cl_pl          = result["cl_pl"],
+                sunday_c_off   = result["sunday_c_off"],
+                leave_availed  = result["leave_availed"],
+                add_substract  = result["add_substract"],
+                c_forward      = result["c_forward"],
+                base_salary    = base_salary,
+                days_in_month  = days_in_month,
+                deduction      = result["deduction"],
+                salary_paid    = result["salary_paid"],
+                bank           = bank,
+                is_study_leave = is_study_leave,
             )
 
-        if result["success"]:
-            st.success(result["message"])
-            st.balloons()
-            st.session_state.split_count = 0
+            if not ledger_result["success"]:
+                st.error(ledger_result["message"])
+                st.stop()
+
+            # 2. Save splits (if any)
+            if splits:
+                splits_result = save_salary_splits(employee, month_str, bank, splits)
+                if not splits_result["success"]:
+                    st.warning(
+                        f"Ledger saved, but splits failed: {splits_result['message']}"
+                    )
+
+        st.success(ledger_result["message"])
+        st.balloons()
+        st.session_state.sal_split_count  = 0
+        st.session_state.sal_calc_result  = None
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 8 — View Ledger History (collapsible)
+    # ════════════════════════════════════════════════════════════════════════
+    with st.expander("📋 View full salary ledger (all employees, all months)"):
+        with st.spinner("Loading ledger…"):
+            ledger_df = fetch_salary_ledger()
+        if ledger_df.empty:
+            st.info("No records saved yet.")
         else:
-            st.error(result["message"])
+            # Filter to selected employee if desired
+            show_all = st.checkbox("Show all employees", value=False)
+            if not show_all:
+                ledger_df = ledger_df[
+                    ledger_df["Employee"].str.strip().str.lower()
+                    == employee.strip().lower()
+                ]
+            st.dataframe(ledger_df, use_container_width=True)
+
+            buf = io.StringIO()
+            ledger_df.to_csv(buf, index=False)
+            st.download_button(
+                "⬇️ Download Ledger (CSV)",
+                buf.getvalue(),
+                "salary_ledger.csv",
+                "text/csv",
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -527,10 +902,9 @@ def _show_user_management():
 
     st.subheader("Add New Associate")
     with st.form("add_user_form"):
-        new_name = st.text_input("Full Name", placeholder="e.g. Aparna Pradyot Maitra")
-        new_pin  = st.text_input(
-            "3-Digit PIN", type="password", max_chars=3, placeholder="• • •"
-        )
+        new_name  = st.text_input("Full Name", placeholder="e.g. Aparna Pradyot Maitra")
+        new_pin   = st.text_input("3-Digit PIN", type="password",
+                                  max_chars=3, placeholder="• • •")
         submitted = st.form_submit_button("Add Associate", use_container_width=True)
 
     if submitted:
@@ -543,13 +917,15 @@ def _show_user_management():
                 add_user(new_name.strip(), new_pin.strip(), role="associate")
                 st.success(f"✅ '{new_name.strip()}' added successfully.")
             except Exception as e:
-                st.error(f"Error adding user: {e}")
+                st.error(f"Error: {e}")
 
     st.markdown("---")
     st.subheader("Current Associates")
     try:
         users      = fetch_users()
-        associates = users[users["role"].str.strip().str.lower() == "associate"][["name"]].copy()
+        associates = users[
+            users["role"].str.strip().str.lower() == "associate"
+        ][["name"]].copy()
         associates.columns = ["Name"]
         if associates.empty:
             st.info("No associates added yet.")
