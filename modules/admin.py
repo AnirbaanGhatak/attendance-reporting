@@ -905,7 +905,7 @@ def _show_user_management():
         new_name  = st.text_input("Full Name", placeholder="e.g. Aparna Pradyot Maitra")
         new_pin   = st.text_input("3-Digit PIN", type="password",
                               max_chars=3, placeholder="• • •")
-        new_role  = st.selectbox("Role", options=["associate", "admin"])
+        new_role  = st.selectbox("Role", options=["Employee", "Article", "Partner"])
         submitted = st.form_submit_button("Add User", use_container_width=True)
 
     if submitted:
