@@ -111,12 +111,7 @@ def _parse_flat_attendance(file_obj, employee_name: str) -> pd.DataFrame | None:
     Expected columns: Date | InTime | OutTime | Shift | Total_Duration | Status | Days_Count | Source
     """
     try:
-        filename = getattr(file_obj, "name", "")
-        if isinstance(filename, tuple):
-            filename = filename[0]
-        filename = str(filename)
-        engine = "openpyxl" if filename.lower().endswith(".xlsx") else "xlrd"
-        df = pd.read_excel(file_obj, sheet_name=0, header=0, engine=engine)
+        df = pd.read_excel(file_obj, sheet_name=0, header=0, engine="openpyxl")
     except Exception as e:
         st.error(f"Could not read file: {e}")
         return None
@@ -128,7 +123,7 @@ def _parse_flat_attendance(file_obj, employee_name: str) -> pd.DataFrame | None:
         st.error("File does not have expected columns (Date, Status). Check the file.")
         return None
 
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
     df = df.dropna(subset=["Date"])
     df["Employee_Name"] = employee_name
     df["Source"]        = df.get("Source", "In-Office")
@@ -793,17 +788,20 @@ def _show_salary_processing():
     xls_employee_name   = ""
 
     if uploaded:
+        import io as _io
 
         filename = getattr(uploaded, "name", "")
-        filename = str(filename[0])
+        if isinstance(filename, tuple):
+            filename = filename[0]
+        filename = str(filename)
 
         file_bytes = uploaded.read()
-
-        import io as _io
-        peek_engine = "openpyxl" if filename.lower().endswith(".xlsx") else "xlrd"
+        is_xlsx = filename.lower().endswith(".xlsx")
+        print(is_xlsx)
+        peek_engine = "openpyxl" if is_xlsx else "xlrd"
 
         try:
-            peek = pd.read_excel(_io.BytesIO(file_bytes), sheet_name="Attendance", header=None, engine=peek_engine, nrows=1)
+            peek = pd.read_excel(_io.BytesIO(file_bytes), header=None, engine=peek_engine, nrows=1)
             
             is_flat = str(peek.iloc[0,0]).strip().lower() == "date"
         except:
@@ -826,7 +824,10 @@ def _show_salary_processing():
             else:
                 auto_leave_availed = _auto_leave_availed(month_df)
                 auto_sunday_c_off  = _auto_sunday_c_off(month_df)
-
+                
+                st.session_state["sal_leave_availed"] = float(auto_leave_availed)
+                st.session_state["sal_sc_off_base"]   = float(auto_sunday_c_off)
+              
                 st.success(
                     f"✅ **{xls_employee_name}** — {len(month_df)} calendar days found  |  "
                     f"Auto Leave Availed: **{auto_leave_availed}**  |  "
