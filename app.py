@@ -19,7 +19,7 @@ from modules.admin import show_admin_module
 
 # ── Page config (must be the very first Streamlit call) ──────────────────────
 st.set_page_config(
-    page_title="Attendance & Salary System",
+    page_title="Attendance System",
     page_icon="📋",
     layout="centered",
     initial_sidebar_state="auto",
@@ -46,7 +46,7 @@ def main():
 
     if st.session_state.logged_in:
         # ── Already logged in — route to the correct module ───────────────────
-        if st.session_state.user_role == "associate":
+        if st.session_state.user_role in ["employee", "article"]:
             show_attendance_module()
         elif st.session_state.user_role == "admin":
             show_admin_module()
@@ -56,11 +56,11 @@ def main():
 
 
 def _show_landing():
-    st.title("📋 Attendance & Salary System")
-    st.caption("Out-Office Attendance Tracking & Salary Management")
+    st.title("📋 Attendance System")
+    st.caption("Out-Office Attendance Tracking Management")
     st.markdown("---")
 
-    tab1, tab2 = st.tabs(["👤  Associate — Mark Attendance", "🔐  Admin — Salary & Reports"])
+    tab1, tab2 = st.tabs(["👤  Users — Mark Attendance", "🔐  Admin"])
 
     with tab1:
         # Delegates to the attendance module's login section

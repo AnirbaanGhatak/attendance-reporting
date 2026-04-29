@@ -19,7 +19,8 @@ from utils.gsheets import (
     verify_associate,
     mark_attendance,
     mark_checkout,
-    get_today_status
+    get_today_status,
+    fetch_users
 )
 
 
@@ -29,7 +30,7 @@ from utils.gsheets import (
 
 def show_attendance_module():
     """Renders the full attendance module (login + mark-attendance screen)."""
-    if not st.session_state.get("logged_in") or st.session_state.user_role != "associate":
+    if not st.session_state.get("logged_in") or st.session_state.user_role not in ["article", "employee"]:
         _show_associate_login()
     else:
         _show_mark_attendance()

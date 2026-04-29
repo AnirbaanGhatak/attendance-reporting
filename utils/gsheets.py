@@ -17,7 +17,7 @@ Spreadsheet tabs:
 
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import datetime, date,timezone,timedelta
 
 import gspread
 import pandas as pd
@@ -65,6 +65,9 @@ def _get_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def _get_worksheet(tab: str) -> gspread.Worksheet:
     client = _get_client()
     sh = client.open_by_key(st.secrets["sheets"]["spreadsheet_id"])
@@ -80,7 +83,7 @@ def _ensure_header(ws: gspread.Worksheet, headers: list[str]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Users
 # ─────────────────────────────────────────────────────────────────────────────
-
+@st.cache_data(ttl=120)
 def fetch_users() -> pd.DataFrame:
     ws      = _get_worksheet(TAB_USERS)
     records = ws.get_all_records()
@@ -101,7 +104,7 @@ def verify_associate(name: str, pin: str) -> bool:
         match = users[
             (users["name"].str.strip().str.lower() == name.strip().lower()) &
             (users["pin"].astype(str).str.strip()  == pin.strip()) &
-            (users["role"].str.strip().str.lower()  == "associate")
+            (users["role"].str.strip().str.lower().isin(["article", "employee"]))
         ]
         return not match.empty
     except Exception:
@@ -111,7 +114,7 @@ def verify_associate(name: str, pin: str) -> bool:
 def get_associate_names() -> list[str]:
     try:
         users      = fetch_users()
-        associates = users[users["role"].str.strip().str.lower() == "associate"]
+        associates = users[users["role"].str.strip().str.lower().isin(["article", "employee"])]
         return sorted(associates["name"].tolist())
     except Exception:
         return []
@@ -126,8 +129,8 @@ def fetch_all_employee_names() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def mark_attendance(name: str, company: str, latitude: float, longitude: float) -> dict:
-    today = date.today().isoformat()
-    now   = datetime.now().strftime("%H:%M:%S")
+    today = datetime.now(IST).date().isoformat()
+    now   = datetime.now(IST).strftime("%H:%M:%S")
     try:
         ws = _get_worksheet(TAB_ATTENDANCE)
         _ensure_header(ws, ["Name", "Date", "Company", "InTime", "OutTime", "Latitude", "Longitude"])
@@ -150,8 +153,8 @@ def mark_attendance(name: str, company: str, latitude: float, longitude: float) 
 
 
 def mark_checkout(name: str) -> dict:
-    today = date.today().isoformat()
-    now   = datetime.now().strftime("%H:%M:%S")
+    today = datetime.now(IST).date().isoformat()
+    now   = datetime.now(IST).strftime("%H:%M:%S")
     try:
         ws   = _get_worksheet(TAB_ATTENDANCE)
         rows = ws.get_all_records()
@@ -184,7 +187,7 @@ def get_today_status(name: str) -> dict:
     Returns the associate's attendance state for today.
     Possible states: "none" | "checked_in" | "checked_out"
     """
-    today = date.today().isoformat()
+    today = datetime.now(IST).date().isoformat()
     try:
         ws   = _get_worksheet(TAB_ATTENDANCE)
         rows = ws.get_all_records()
@@ -208,7 +211,7 @@ def get_today_status(name: str) -> dict:
 
 
 
-
+@st.cache_data(ttl=120)
 def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:
     try:
         ws      = _get_worksheet(TAB_ATTENDANCE)
@@ -230,6 +233,7 @@ def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:
 # Salary Ledger
 # ─────────────────────────────────────────────────────────────────────────────
 
+@st.cache_data(ttl=120)
 def fetch_salary_ledger() -> pd.DataFrame:
     """Return the full salary_ledger sheet as a DataFrame."""
     try:
@@ -323,7 +327,7 @@ def save_salary_ledger_row(
                 ),
             }
 
-        saved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        saved_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
         ws.append_row([
             employee, month, b_forward, cl_pl,
             sunday_c_off, leave_availed, add_substract,
@@ -332,6 +336,7 @@ def save_salary_ledger_row(
             "Yes" if is_study_leave else "No",
             saved_at,
         ])
+        fetch_salary_ledger.clear()
         return {"success": True, "message": f"✅ Ledger saved for {employee} — {month}."}
     except Exception as e:
         return {"success": False, "message": f"Error saving ledger: {e}"}
@@ -356,7 +361,7 @@ def save_salary_splits(
     try:
         ws = _get_worksheet(TAB_SPLITS)
         _ensure_header(ws, SPLITS_HEADERS)
-        saved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        saved_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
         for sp in splits:
             ws.append_row([
                 employee, month,

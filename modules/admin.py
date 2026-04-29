@@ -105,6 +105,41 @@ def _is_holiday(d: date) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # XLS Parser
 # ─────────────────────────────────────────────────────────────────────────────
+def _parse_flat_attendance(file_obj, employee_name: str) -> pd.DataFrame | None:
+    """
+    Parses the flat XLSX exported from the attendance report page.
+    Expected columns: Date | InTime | OutTime | Shift | Total_Duration | Status | Days_Count | Source
+    """
+    try:
+        filename = getattr(file_obj, "name", "")
+        if isinstance(filename, tuple):
+            filename = filename[0]
+        filename = str(filename)
+        engine = "openpyxl" if filename.lower().endswith(".xlsx") else "xlrd"
+        df = pd.read_excel(file_obj, sheet_name=0, header=0, engine=engine)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+        return None
+
+    # Normalise column names
+    df.columns = [c.strip() for c in df.columns]
+
+    if "Status" not in df.columns or "Date" not in df.columns:
+        st.error("File does not have expected columns (Date, Status). Check the file.")
+        return None
+
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["Date"])
+    df["Employee_Name"] = employee_name
+    df["Source"]        = df.get("Source", "In-Office")
+
+    return df[[
+        "Employee_Name", "Date", "InTime", "OutTime",
+        "Shift", "Total_Duration", "Status", "Days_Count", "Source",
+    ]]
+
+
+
 
 def _parse_attendance_xls(file_obj) -> pd.DataFrame | None:
     """
@@ -117,7 +152,10 @@ def _parse_attendance_xls(file_obj) -> pd.DataFrame | None:
     Returns None (and shows st.error) on any failure.
     """
     try:
-        raw = pd.read_excel(file_obj, sheet_name=0, header=None, engine="xlrd")
+        filename = getattr(file_obj, "name", ""),
+        filename = filename[0]
+        engine = "openpyxl" if filename.endswith(".xlsx") else "xlrd"
+        raw = pd.read_excel(file_obj, sheet_name=0, header=None, engine=engine)
     except Exception as e:
         st.error(f"Could not read file: {e}")
         return None
@@ -333,7 +371,7 @@ def _show_admin_login():
 # Phase A – Attendance Consolidation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _show_attendance_consolidation():
+def _show_attendance_consolidation2():
     st.title("📊 Monthly Attendance Report")
     st.caption(
         "Upload one .xls per employee from your attendance machine. "
@@ -359,7 +397,7 @@ def _show_attendance_consolidation():
     st.subheader("Step 1 — Upload Attendance Files")
     uploaded_files = st.file_uploader(
         "Upload XLS files (one per employee)",
-        type=["xls"], accept_multiple_files=True,
+        type=["xls", "xlsx"], accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
@@ -439,6 +477,13 @@ def _show_attendance_consolidation():
         st.markdown("#### Summary")
         st.dataframe(summary, use_container_width=True)
 
+        st.markdown("#### Individual Records")
+        employees = combined["Employee_Name"].unique()
+        for emp in sorted(employees):
+            emp_df = combined[combined["Employee_Name"] == emp].drop(columns=["Employee_Name"])
+            with st.expander(f"📄 {emp}"):
+                st.dataframe(emp_df.reset_index(drop=True), use_container_width=True)
+
         col_a, col_b = st.columns(2)
         with col_a:
             buf = io.StringIO()
@@ -453,7 +498,227 @@ def _show_attendance_consolidation():
                                f"attendance_summary_{month_str}.csv", "text/csv",
                                use_container_width=True)
 
+def _show_attendance_consolidation():
+    st.title("📊 Monthly Attendance Report")
+    st.caption(
+        "Upload one .xls per employee from your attendance machine. "
+        "Select the matching name from your system if the names differ."
+    )
+    st.markdown("---")
 
+    col1, col2 = st.columns(2)
+    with col1:
+        year_opts = list(range(2024, datetime.now().year + 2))
+        year = st.selectbox("Year", options=year_opts,
+                            index=year_opts.index(datetime.now().year))
+    with col2:
+        month_num = st.selectbox(
+            "Month", options=list(range(1, 13)),
+            format_func=lambda m: datetime(2000, m, 1).strftime("%B"),
+            index=datetime.now().month - 1,
+        )
+    month_str   = f"{year}-{month_num:02d}"
+    month_label = datetime(year, month_num, 1).strftime("%B %Y")
+    st.markdown("---")
+
+    # ── Step 1: Upload ────────────────────────────────────────────────────────
+    st.subheader("Step 1 — Upload Attendance Files")
+    uploaded_files = st.file_uploader(
+        "Upload XLS files (one per employee)",
+        type=["xls", "xlsx"], accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
+
+    # name_map: { xls_name -> system_name }
+    # stored in session state so selectboxes persist across reruns
+    if "att_name_map" not in st.session_state:
+        st.session_state.att_name_map = {}
+
+    system_names = ["— same as file —"] + fetch_all_employee_names()
+    in_office_frames: list[pd.DataFrame] = []
+
+    if uploaded_files:
+        st.write(f"**{len(uploaded_files)} file(s) uploaded**")
+        for uf in uploaded_files:
+            parsed = _parse_attendance_xls(uf)
+            if parsed is None:
+                continue
+
+            xls_name   = parsed["Employee_Name"].iloc[0]
+            month_rows = parsed[parsed["Date"].str.startswith(month_str, na=False)].copy()
+
+            if month_rows.empty:
+                st.warning(f"⚠️ `{uf.name}` — no rows for {month_label}. Skipped.")
+                continue
+
+            # ── Name mapping selectbox ─────────────────────────────────────
+            col_a, col_b = st.columns([2, 3])
+            with col_a:
+                st.markdown(f"**Name in file:** `{xls_name}`")
+            with col_b:
+                default_idx = 0
+                if xls_name in st.session_state.att_name_map:
+                    saved = st.session_state.att_name_map[xls_name]
+                    if saved in system_names:
+                        default_idx = system_names.index(saved)
+
+                chosen = st.selectbox(
+                    f"Map to system name",
+                    options=system_names,
+                    index=default_idx,
+                    key=f"name_map_{xls_name}",
+                    label_visibility="collapsed",
+                )
+                st.session_state.att_name_map[xls_name] = chosen
+
+            # Apply mapped name
+            final_name = xls_name if chosen == "— same as file —" else chosen
+            month_rows["Employee_Name"] = final_name
+
+            working_days = month_rows["Days_Count"].sum()
+            st.success(
+                f"✅ **{final_name}**  |  "
+                f"{len(month_rows)} calendar days  |  "
+                f"**{working_days:.1f} working days**"
+            )
+            in_office_frames.append(month_rows)
+            st.markdown("---")
+
+    in_office_df = (
+        pd.concat(in_office_frames, ignore_index=True)
+        if in_office_frames else pd.DataFrame()
+    )
+
+    # ── Step 2: Generate ─────────────────────────────────────────────────────
+    st.subheader("Step 2 — Merge with Out-Office Records")
+
+    if st.button("🔄 Generate Report", type="primary", use_container_width=True):
+        with st.spinner("Fetching out-office data from Google Sheets…"):
+            out_df = fetch_out_office_attendance(month=month_str)
+
+        if out_df.empty and in_office_df.empty:
+            st.warning("No data found for the selected month.")
+            return
+
+        out_df_proc = pd.DataFrame()
+        if not out_df.empty:
+            out_df_proc = pd.DataFrame({
+                "Employee_Name" : out_df["Name"],
+                "Date"          : out_df["Date"],
+                "InTime"        : out_df.get("Time", ""),
+                "OutTime"       : "",
+                "Shift"         : "Out-Office",
+                "Total_Duration": "",
+                "Status"        : "Present (Out-Office)",
+                "Days_Count"    : 1.0,
+                "Source"        : "Out-Office",
+            })
+
+        frames   = [f for f in [in_office_df, out_df_proc] if not f.empty]
+        combined = pd.concat(frames, ignore_index=True)
+        combined = combined.sort_values(["Employee_Name", "Date"]).reset_index(drop=True)
+
+        # ── Summary table (all employees, one row each) ───────────────────────
+        summary_rows = []
+        for emp, grp in combined.groupby("Employee_Name"):
+            present    = int((grp["Days_Count"] == 1.0).sum())
+            half       = int((grp["Days_Count"] == 0.5).sum())
+            weekly_off = int(grp["Status"].str.lower().str.contains("weeklyoff", na=False).sum())
+            absent     = int((grp["Days_Count"] == 0.0).sum()) - weekly_off
+            summary_rows.append({
+                "Employee"           : emp,
+                "Present Days"       : present,
+                "Half Days"          : half,
+                "Absent Days"        : max(absent, 0),
+                "Weekly Off"         : weekly_off,
+                "Total Working Days" : grp["Days_Count"].sum(),
+            })
+        summary = pd.DataFrame(summary_rows)
+
+        st.markdown(f"### Summary — {month_label}")
+        st.dataframe(
+            summary.reset_index(drop=True),
+            use_container_width=True,
+            column_config={
+                "Employee"           : st.column_config.TextColumn("Employee", width="large"),
+                "Present Days"       : st.column_config.NumberColumn("Present", width="small"),
+                "Half Days"          : st.column_config.NumberColumn("Half Days", width="small"),
+                "Absent Days"        : st.column_config.NumberColumn("Absent", width="small"),
+                "Weekly Off"         : st.column_config.NumberColumn("Weekly Off", width="small"),
+                "Total Working Days" : st.column_config.NumberColumn("Total Working Days", width="medium"),
+            },
+            hide_index=True,
+        )
+
+        # ── Per-employee breakdown ────────────────────────────────────────────
+        st.markdown("### Individual Records")
+        for emp in sorted(combined["Employee_Name"].unique()):
+            emp_df = combined[combined["Employee_Name"] == emp].drop(
+                columns=["Employee_Name"]
+            ).reset_index(drop=True)
+
+            emp_summary = summary[summary["Employee"] == emp].drop(
+                columns=["Employee"]
+            ).reset_index(drop=True)
+
+            with st.expander(f"📄 {emp}"):
+                st.markdown("**Summary**")
+                st.dataframe(
+                    emp_summary,
+                    use_container_width=True,
+                    column_config={
+                        "Present Days"       : st.column_config.NumberColumn("Present"),
+                        "Half Days"          : st.column_config.NumberColumn("Half Days"),
+                        "Absent Days"        : st.column_config.NumberColumn("Absent"),
+                        "Weekly Off"         : st.column_config.NumberColumn("Weekly Off"),
+                        "Total Working Days" : st.column_config.NumberColumn("Total Working Days"),
+                    },
+                    hide_index=True,
+                )
+
+                st.markdown("**Daily Breakdown**")
+                st.dataframe(
+                    emp_df,
+                    use_container_width=True,
+                    column_config={
+                        "Date"           : st.column_config.TextColumn("Date", width="medium"),
+                        "InTime"         : st.column_config.TextColumn("In", width="small"),
+                        "OutTime"        : st.column_config.TextColumn("Out", width="small"),
+                        "Shift"          : st.column_config.TextColumn("Shift", width="small"),
+                        "Total_Duration" : st.column_config.TextColumn("Duration", width="small"),
+                        "Status"         : st.column_config.TextColumn("Status", width="medium"),
+                        "Days_Count"     : st.column_config.NumberColumn("Days", width="small"),
+                        "Source"         : st.column_config.TextColumn("Source", width="small"),
+                    },
+                    hide_index=True,
+                )
+
+                # Individual downloads
+                dl_col1, dl_col2 = st.columns(2)
+                with dl_col1:
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                        emp_df.to_excel(writer, index=False, sheet_name="Attendance")
+                    st.download_button(
+                        f"⬇️ Full Report (XLSX)",
+                        data=buf.getvalue(),
+                        file_name=f"{emp}_attendance_{month_str}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key=f"dl_full_{emp}",
+                    )
+                with dl_col2:
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                        emp_summary.to_excel(writer, index=False, sheet_name="Summary")
+                    st.download_button(
+                        f"⬇️ Summary (XLSX)",
+                        data=buf.getvalue(),
+                        file_name=f"{emp}_summary_{month_str}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key=f"dl_sum_{emp}",
+                    )
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase B – Salary Processing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -518,7 +783,7 @@ def _show_salary_processing():
     st.caption("Upload the XLS for this employee. The system auto-calculates Leave Availed and Sunday/C Off.")
 
     uploaded = st.file_uploader(
-        "Upload XLS", type=["xls"], key="sal_xls_upload",
+        "Upload XLS", type=["xls", "xlsx"], key="sal_xls_upload_v2",
         label_visibility="collapsed",
     )
 
@@ -528,7 +793,27 @@ def _show_salary_processing():
     xls_employee_name   = ""
 
     if uploaded:
-        parsed = _parse_attendance_xls(uploaded)
+
+        filename = getattr(uploaded, "name", "")
+        filename = str(filename[0])
+
+        file_bytes = uploaded.read()
+
+        import io as _io
+        peek_engine = "openpyxl" if filename.lower().endswith(".xlsx") else "xlrd"
+
+        try:
+            peek = pd.read_excel(_io.BytesIO(file_bytes), sheet_name="Attendance", header=None, engine=peek_engine, nrows=1)
+            
+            is_flat = str(peek.iloc[0,0]).strip().lower() == "date"
+        except:
+            is_flat = False
+
+        if is_flat:
+            parsed = _parse_flat_attendance(_io.BytesIO(file_bytes), employee)
+        else:
+            parsed = _parse_attendance_xls(_io.BytesIO(file_bytes))
+
         if parsed is not None:
             xls_employee_name = parsed["Employee_Name"].iloc[0]
             month_df = parsed[parsed["Date"].str.startswith(month_str, na=False)].copy()
@@ -905,7 +1190,7 @@ def _show_user_management():
         new_name  = st.text_input("Full Name", placeholder="e.g. Aparna Pradyot Maitra")
         new_pin   = st.text_input("3-Digit PIN", type="password",
                               max_chars=3, placeholder="• • •")
-        new_role  = st.selectbox("Role", options=["Employee", "Article", "Partner"])
+        new_role  = st.selectbox("Role", options=["employee", "article", "partner", "admin"])
         submitted = st.form_submit_button("Add User", use_container_width=True)
 
     if submitted:
@@ -916,7 +1201,8 @@ def _show_user_management():
         else:
             try:
                 add_user(new_name.strip(), new_pin.strip(), role=new_role)
-                st.success(f"✅ '{new_name.strip()}' added as {new_role}.")
+                role_label = {"article": "Article", "employee": "Employee", "admin": "Admin"}
+                st.success(f"✅ '{new_name.strip()}' added as {role_label.get(new_role, new_pin)}.")
             except Exception as e:
                 st.error(f"Error: {e}")
 

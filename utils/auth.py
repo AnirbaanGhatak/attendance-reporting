@@ -19,9 +19,9 @@ def init_session():
             st.session_state[key] = val
 
 
-def login_associate(name: str):
+def login_associate(name: str, role:str = "article"):
     st.session_state.logged_in = True
-    st.session_state.user_role = "associate"
+    st.session_state.user_role = role
     st.session_state.user_name = name
 
 
