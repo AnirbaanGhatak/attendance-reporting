@@ -1,0 +1,16 @@
+# Ignore the local secrets folder
+.streamlit/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+modules/__pycache__
+utils/__pycache__
+
+# Ignore local environment folders (if you have one)
+.atd/
+
+README.md
+

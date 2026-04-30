@@ -1,2 +1,4 @@
 .atd
 .streamlit
+.dockerignore
+.devcontainer

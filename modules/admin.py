@@ -119,6 +119,17 @@ def _parse_flat_attendance(file_obj, employee_name: str) -> pd.DataFrame | None:
     # Normalise column names
     df.columns = [c.strip() for c in df.columns]
 
+    def _status_to_days(status: str) -> float:
+        s = str(status).strip().lower().replace(" ", "")
+        if s in ("present", "weeklyoff", "presentonod", "weeklyoffpresent", "holidaypresent"):
+            return 1.0
+        if "\u00bdpresent" in s or "half" in s or "1/2" in s:
+            return 0.5
+        return 0.0
+
+    df["Days_Count"] = df["Status"].apply(_status_to_days)
+
+
     if "Status" not in df.columns or "Date" not in df.columns:
         st.error("File does not have expected columns (Date, Status). Check the file.")
         return None
@@ -206,7 +217,7 @@ def _parse_attendance_xls(file_obj) -> pd.DataFrame | None:
     # ── Days_Count ────────────────────────────────────────────────────────────
     def _days_count(status: str) -> float:
         s = status.strip().lower()
-        if s == "present":
+        if s in ("present", "weeklyoff", "presentonod", "weeklyoffpresent","holidaypresent"):
             return 1.0
         if "\u00bdpresent" in s or "half" in s or "1/2" in s:
             return 0.5
@@ -237,7 +248,9 @@ def _auto_leave_availed(df: pd.DataFrame) -> float:
     total = 0.0
     for _, row in df.iterrows():
         s = str(row["Status"]).strip().lower()
-        if "absent" in s:
+        if s in ("weeklyoff", "weeklyoffpresent", "holidaypresent", "presentonod"):
+            continue
+        elif "absent" in s:
             total += 1.0
         elif "\u00bdpresent" in s or "half" in s or "1/2" in s:
             total += 0.5
@@ -253,7 +266,11 @@ def _auto_sunday_c_off(df: pd.DataFrame, extra_adjustment: float = 0.0) -> float
     total = 0.0
     for _, row in df.iterrows():
         s = str(row["Status"]).strip().lower()
-        worked = s == "present" or "\u00bdpresent" in s or "1/2" in s or "half" in s
+        if s in ("weeklyoffpresent", "holidaypresent"):
+            total += 1.0
+            continue
+
+        worked = s in ("present", "presentonod") or "\u00bdpresent" in s or "1/2" in s or "half" in s
         if not worked:
             continue
         try:
