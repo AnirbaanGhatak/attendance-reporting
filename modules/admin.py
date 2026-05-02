@@ -1075,6 +1075,7 @@ def _show_salary_processing():
         hc = st.columns([3, 2])
         hc[0].markdown("**Recipient Name**")
         hc[1].markdown("**Amount (₹)**")
+        hc[2].markdown("**Bank Account**")
 
         for i in range(st.session_state.sal_split_count):
             rc = st.columns([3, 2])
@@ -1090,7 +1091,15 @@ def _show_salary_processing():
                     label_visibility="collapsed",
                     min_value=0.0, step=100.0, format="%.2f",
                 )
-            splits.append({"name": rec_name, "amount": rec_amount})
+
+            with rc[2]:
+                rec_bank = st.selectbox(
+                    f"b{i}", key=f"sp_bank_{i}",
+                    options=bank_options,
+                    label_visibikity="collapsed",
+                )
+
+            splits.append({"name": rec_name, "amount": rec_amount, "bank":rec_bank})
             running_total += rec_amount
 
         if base_salary > 0 and st.session_state.sal_calc_result:
@@ -1153,7 +1162,7 @@ def _show_salary_processing():
 
             # 2. Save splits (if any)
             if splits:
-                splits_result = save_salary_splits(employee, month_str, bank, splits)
+                splits_result = save_salary_splits(employee, month_str, splits)
                 if not splits_result["success"]:
                     st.warning(
                         f"Ledger saved, but splits failed: {splits_result['message']}"
