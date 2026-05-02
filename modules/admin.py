@@ -897,6 +897,17 @@ def _show_salary_processing():
             help="Carry-forward from the last saved month. Edit only if correcting an error.",
         )
     with col_b:
+        is_article = False
+        try:
+            users = fetch_users()
+            user_row = users[users["name"].str.strip().str.lower()==employee.strip().lower()]
+            if not user_row.empty:
+                is_article = user_row.iloc[0]["role"].strip().lower() == "article"
+        except Exception:
+            pass
+        cl_pl_default = 0.0 if (is_study_leave or is_article) else 1.5
+        cl_pl_label = "CL/PL Eligible (0 - Article)" if is_article else "CL/PL Eligible (always 1.5)"
+     
         cl_pl = st.number_input(
             "CL/PL Eligible (always 1.5)",
             value=0.0 if is_study_leave else 1.5,

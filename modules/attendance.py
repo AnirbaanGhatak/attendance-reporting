@@ -96,12 +96,25 @@ def _show_mark_attendance():
         current_month = today.strftime("%Y-%m")
         leave_balance = fetch_carry_forward(name, current_month)
         # current month's accrual isn't saved yet so add 1.5 as preview
-        projected = leave_balance + 1.5
-        st.info(
-            f"🗓️ **Leave Balance**  \n"
-            f"Carried forward: **{leave_balance:.1f} days**  \n"
-            f"After this month's CL/PL: **{projected:.1f} days** *(estimated)*"
-        )
+        try:
+            users    = fetch_users()
+            user_row = users[users["name"].str.strip().str.lower() == name.strip().lower()]
+            role     = user_row.iloc[0]["role"].strip().lower() if not user_row.empty else "employee"
+        except Exception:
+            role = "employee"
+
+        if role == "article":
+            st.info(
+                f"🗓️ **Leave Balance**  \n"
+                f"Holidays remaining: **{leave_balance:.1f} days** *(out of 24)*"
+            )
+        else:
+            projected = leave_balance + 1.5
+            st.info(
+                f"🗓️ **Leave Balance**  \n"
+                f"Carried forward: **{leave_balance:.1f} days**  \n"
+                f"After this month's CL/PL: **{projected:.1f} days** *(estimated)*"
+            )
     except Exception:
         pass   # silently skip if ledger unavailable
 
