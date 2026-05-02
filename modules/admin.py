@@ -1083,7 +1083,7 @@ def _show_salary_processing():
     running_total = 0.0
 
     if st.session_state.sal_split_count > 0:
-        hc = st.columns([3, 2])
+        hc = st.columns([3, 2,2])
         hc[0].markdown("**Recipient Name**")
         hc[1].markdown("**Amount (₹)**")
         hc[2].markdown("**Bank Account**")

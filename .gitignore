@@ -2,3 +2,5 @@
 .streamlit
 .dockerignore
 .devcontainer
+modules/__pycache__
+utils/__pycache__
