@@ -1106,7 +1106,7 @@ def _show_salary_processing():
                 rec_bank = st.selectbox(
                     f"b{i}", key=f"sp_bank_{i}",
                     options=bank_options,
-                    label_visibikity="collapsed",
+                    label_visibility="collapsed",
                 )
 
             splits.append({"name": rec_name, "amount": rec_amount, "bank":rec_bank})
