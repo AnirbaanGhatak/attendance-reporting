@@ -1083,13 +1083,13 @@ def _show_salary_processing():
     running_total = 0.0
 
     if st.session_state.sal_split_count > 0:
-        hc = st.columns([3, 2,2])
+        hc = st.columns([3, 2, 2])
         hc[0].markdown("**Recipient Name**")
         hc[1].markdown("**Amount (₹)**")
         hc[2].markdown("**Bank Account**")
 
         for i in range(st.session_state.sal_split_count):
-            rc = st.columns([3, 2])
+            rc = st.columns([3, 2, 2])
             with rc[0]:
                 rec_name = st.text_input(
                     f"n{i}", key=f"sp_name_{i}",
@@ -1102,7 +1102,6 @@ def _show_salary_processing():
                     label_visibility="collapsed",
                     min_value=0.0, step=100.0, format="%.2f",
                 )
-
             with rc[2]:
                 rec_bank = st.selectbox(
                     f"b{i}", key=f"sp_bank_{i}",
