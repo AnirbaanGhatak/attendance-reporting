@@ -20,7 +20,8 @@ from utils.gsheets import (
     mark_attendance,
     mark_checkout,
     get_today_status,
-    fetch_users
+    fetch_users,
+    fetch_carry_forward
 )
 
 
@@ -90,6 +91,34 @@ def _show_mark_attendance():
     st.title("📍 Attendance")
     st.markdown(f"**Associate:** {name}")
     st.markdown(f"**Date:** {today.strftime('%A, %d %B %Y')}")
+
+    try:
+        current_month = today.strftime("%Y-%m")
+        leave_balance = fetch_carry_forward(name, current_month)
+        # current month's accrual isn't saved yet so add 1.5 as preview
+        try:
+            users    = fetch_users()
+            user_row = users[users["name"].str.strip().str.lower() == name.strip().lower()]
+            role     = user_row.iloc[0]["role"].strip().lower() if not user_row.empty else "employee"
+        except Exception:
+            role = "employee"
+
+        if role == "article":
+            st.info(
+                f"🗓️ **Leave Balance**  \n"
+                f"Holidays remaining: **{leave_balance:.1f} days** *(out of 24)*"
+            )
+        else:
+            projected = leave_balance + 1.5
+            st.info(
+                f"🗓️ **Leave Balance**  \n"
+                f"Carried forward: **{leave_balance:.1f} days**  \n"
+                f"After this month's CL/PL: **{projected:.1f} days** *(estimated)*"
+            )
+    except Exception:
+        pass   # silently skip if ledger unavailable
+
+
     st.markdown("---")
 
     # Check today's status first

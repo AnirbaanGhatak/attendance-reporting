@@ -83,7 +83,7 @@ def _ensure_header(ws: gspread.Worksheet, headers: list[str]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Users
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=30)
 def fetch_users() -> pd.DataFrame:
     ws      = _get_worksheet(TAB_USERS)
     records = ws.get_all_records()
@@ -349,7 +349,6 @@ def save_salary_ledger_row(
 def save_salary_splits(
     employee: str,
     month: str,
-    bank: str,
     splits: list[dict],  # [{"name": str, "amount": float}, ...]
 ) -> dict:
     """
@@ -367,7 +366,8 @@ def save_salary_splits(
                 employee, month,
                 sp.get("name", ""),
                 round(float(sp.get("amount", 0)), 2),
-                bank, saved_at,
+                sp.get("bank", ""),
+                saved_at,
             ])
         return {"success": True, "message": f"✅ {len(splits)} split(s) saved."}
     except Exception as e:
