@@ -159,24 +159,47 @@ def mark_checkout(name: str, latitude: float, longitude: float) -> dict:
     now   = datetime.now(IST).strftime("%H:%M:%S")
     try:
         ws   = _get_worksheet(TAB_ATTENDANCE)
-        rows = ws.get_all_records()
-        for i, row in enumerate(rows):
+        # rows = ws.get_all_records()
+
+        all_values = ws.get_all_values()
+
+        if not all_values:
+            return {"success": False, "message": "Sheet is empty"}
+
+        headers = [h.strip() for h in all_values[0]]
+
+        try:
+            name_idx = headers.index("Name")
+            date_idx = headers.index("Date")
+            out_idx = headers.index("OutTime")
+            out_lat_idx = headers.index("Out_Latitude")
+            out_lon_idx = headers.index("Out_Longitude")
+
+        except ValueError as e:
+            return{"success": False, "message": f"Column not found: {e}"}
+        
+
+        for i, row in enumerate(all_values[1:], start=2):
+            row_name = str(row[name_idx]).strip().lower() if name_idx < len(row) else ""
+            row_date = str(row[date_idx]).strip() if date_idx < len(row) else ""
+            row_out  = str(row[out_idx]).strip() if out_idx < len(row) else ""
+
             if (
-                str(row.get("Name", "")).strip().lower() == name.strip().lower()
-                and str(row.get("Date", "")).strip() == today
-                and not str(row.get("OutTime", "")).strip()
-            ):
-                ws.update_cell(i+2, 5, now)
-                ws.update_cell(i + 2, 8, latitude)
-                ws.update_cell(i + 2, 9, longitude)
+                row_name == name.strip().lower()
+                and row_date == today
+                and not row_out 
+                ):
+                ws.update_cell(i, out_idx + 1, now)           # +1 because gspread is 1-indexed
+                ws.update_cell(i, out_lat_idx + 1, latitude)
+                ws.update_cell(i, out_lon_idx + 1, longitude)
                 return {
-                        "success": False,
-                        "message": "Already checked out today.",
+                        "success": True,
+                        "message": f"✅ Checked out at {now}.",
                     }
-            return{
-                "success": False,
-                "message": "No open check-in found. Please check in first.",
-            }
+        return{
+            "success": False,
+            "message": "No open check-in found. Please check in first.",
+        }
     except Exception as e:
         return {"success": False, "message": f"Error: {e}"}
     
