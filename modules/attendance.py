@@ -126,15 +126,15 @@ def _show_mark_attendance():
     state  = status["state"]
 
     if state == "checked_out":
+        trips = status.get("trips", 0)
         st.success(
-            f"✅ Attendance complete for today.\n\n"
-            f"**Company:** {status['company']}  \n"
-            f"**In:** {status['in_time']}  |  **Out:** {status['out_time']}"
+           f"✅ Last check-out recorded.  \n"
+           f"**Company:** {status['company']}  \n"
+           f"**In:** {status['in_time']}  |  **Out:** {status['out_time']}  \n"
+           f"**Trips completed today:** {trips}"
         )
-        if st.button("Logout"):
-            logout()
-            st.rerun()
-        return
+        st.info("Going somewhere else? You can check in again below")
+        
 
     # Location (needed for check-in only)
     if state == "none":
@@ -153,7 +153,14 @@ def _show_mark_attendance():
     st.markdown("---")
 
     # ── CHECK IN ──────────────────────────────────────────────────────────────
-    if state == "none":
+    if state in ("none", "checked_out"):
+        trips = status.get("trips", 0)
+        label = "Check In Again" if state == "checked_out" else "Check In"
+        st.subheader(f"{'🔄' if state == 'checked_out' else '📍'} {label}")
+
+        if trips > 0:
+            st.caption(f"Trip {trips + 1} today")
+
         st.subheader("Check In")
         company = st.text_input(
             "Company / Client Office",
@@ -187,9 +194,11 @@ def _show_mark_attendance():
 
     # ── CHECK OUT ─────────────────────────────────────────────────────────────
     elif state == "checked_in":
+        trips = status.get("trips", 0)
         st.info(
             f"**Checked in** at **{status['in_time']}**  \n"
-            f"**Company:** {status['company']}"
+            f"**Company:** {status['company']}  \n"
+            f"**Trips completed today:** {trips}"
         )
         st.subheader("Check Out")
 
@@ -206,8 +215,12 @@ def _show_mark_attendance():
                 st.rerun()
 
         if check_out_btn:
-            with st.spinner("Saving…"):
-                result = mark_checkout(name)
+            if lat is None or lon is None:
+                st.error("Cannot check out without a valid location.")
+            else:
+                with st.spinner("Saving…"):
+                    result = mark_checkout(name, lat, lon)
+
             if result["success"]:
                 st.success(result["message"])
                 st.rerun()

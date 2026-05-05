@@ -629,7 +629,7 @@ def _show_attendance_consolidation():
         frames   = [f for f in [in_office_df, out_df_proc] if not f.empty]
         combined = pd.concat(frames, ignore_index=True)
         combined = combined.sort_values(["Employee_Name", "Date"]).reset_index(drop=True)
-
+        combined = combined.drop_duplicates(subset=["Employee_Name", "Date", "Source"]).copy()
         # ── Summary table (all employees, one row each) ───────────────────────
         summary_rows = []
         for emp, grp in combined.groupby("Employee_Name"):

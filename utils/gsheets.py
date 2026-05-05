@@ -133,17 +133,19 @@ def mark_attendance(name: str, company: str, latitude: float, longitude: float) 
     now   = datetime.now(IST).strftime("%H:%M:%S")
     try:
         ws = _get_worksheet(TAB_ATTENDANCE)
-        _ensure_header(ws, ["Name", "Date", "Company", "InTime", "OutTime", "Latitude", "Longitude"])
+        _ensure_header(ws, ["Name", "Date", "Company", "InTime", "OutTime", "In_Latitude", "In_Longitude", "Out_Latitude", "Out_Longitude"])
+       
         for row in ws.get_all_records():
             if (
                 str(row.get("Name", "")).strip().lower() == name.strip().lower()
                 and str(row.get("Date", "")).strip() == today
+                and not str(row.get("OutTime", "")).strip()
             ):
                 return {
                     "success": False,
-                    "message": "Already checked in today. Use Check Out instead.",
+                    "message": "You have an open check-in. Please check out first before checking in again.",
                 }
-        ws.append_row([name, today, company.strip(), now, "", latitude, longitude])
+        ws.append_row([name, today, company.strip(), now, "", latitude, longitude, "",""])
         return {
             "success": True,
             "message": f"✅ Checked in at {now}.",
@@ -152,32 +154,51 @@ def mark_attendance(name: str, company: str, latitude: float, longitude: float) 
         return {"success": False, "message": f"Error: {e}"}
 
 
-def mark_checkout(name: str) -> dict:
+def mark_checkout(name: str, latitude: float, longitude: float) -> dict:
     today = datetime.now(IST).date().isoformat()
     now   = datetime.now(IST).strftime("%H:%M:%S")
     try:
         ws   = _get_worksheet(TAB_ATTENDANCE)
-        rows = ws.get_all_records()
-        for i, row in enumerate(rows):
+        # rows = ws.get_all_records()
+
+        all_values = ws.get_all_values()
+
+        if not all_values:
+            return {"success": False, "message": "Sheet is empty"}
+
+        headers = [h.strip() for h in all_values[0]]
+
+        try:
+            name_idx = headers.index("Name")
+            date_idx = headers.index("Date")
+            out_idx = headers.index("OutTime")
+            out_lat_idx = headers.index("Out_Latitude")
+            out_lon_idx = headers.index("Out_Longitude")
+
+        except ValueError as e:
+            return{"success": False, "message": f"Column not found: {e}"}
+        
+
+        for i, row in enumerate(all_values[1:], start=2):
+            row_name = str(row[name_idx]).strip().lower() if name_idx < len(row) else ""
+            row_date = str(row[date_idx]).strip() if date_idx < len(row) else ""
+            row_out  = str(row[out_idx]).strip() if out_idx < len(row) else ""
+
             if (
-                str(row.get("Name", "")).strip().lower() == name.strip().lower()
-                and str(row.get("Date", "")).strip() == today
-            ):
-                if str(row.get("OutTime", "")).strip():
-                    return {
-                        "success": False,
-                        "message": "Already checked out today.",
-                    }
-                # i+2 because gspread is 1-indexed and row 1 is the header
-                out_col = 5   # OutTime is the 5th column
-                ws.update_cell(i + 2, out_col, now)
+                row_name == name.strip().lower()
+                and row_date == today
+                and not row_out 
+                ):
+                ws.update_cell(i, out_idx + 1, now)           # +1 because gspread is 1-indexed
+                ws.update_cell(i, out_lat_idx + 1, latitude)
+                ws.update_cell(i, out_lon_idx + 1, longitude)
                 return {
-                    "success": True,
-                    "message": f"✅ Checked out at {now}.",
-                }
-        return {
+                        "success": True,
+                        "message": f"✅ Checked out at {now}.",
+                    }
+        return{
             "success": False,
-            "message": "No check-in found for today. Please check in first.",
+            "message": "No open check-in found. Please check in first.",
         }
     except Exception as e:
         return {"success": False, "message": f"Error: {e}"}
@@ -191,23 +212,44 @@ def get_today_status(name: str) -> dict:
     try:
         ws   = _get_worksheet(TAB_ATTENDANCE)
         rows = ws.get_all_records()
-        for row in rows:
-            if (
-                str(row.get("Name", "")).strip().lower() == name.strip().lower()
-                and str(row.get("Date", "")).strip() == today
-            ):
-                out = str(row.get("OutTime", "")).strip()
-                inn = str(row.get("InTime", "")).strip()
-                return {
-                    "state"   : "checked_out" if out else "checked_in",
-                    "in_time" : inn,
-                    "out_time": out,
-                    "company" : str(row.get("Company", "")).strip(),
-                }
-        return {"state": "none", "in_time": "", "out_time": "", "company": ""}
+
+        today_rows = [
+            r for r in rows
+            if str(r.get("Name", "")).strip().lower() == name.strip().lower()
+            and str(r.get("Date", "")).strip() == today
+        ]
+
+        if not today_rows:
+            return {"state": "none", "in_time":"", "out_time": "", "company": "", }
+        
+        open_entry = next(
+            (r for r in today_rows if not str(r.get("OutTime", "")).strip()),
+            None
+        )
+
+        completed_trips = sum(1 for r in today_rows if str(r.get("OutTime", "")).strip())
+        
+        if open_entry:
+            return{
+                "state"   : "checked_in",
+                "in_time" : str(open_entry.get("InTime", "")).strip(),
+                "out_time": "",
+                "company" : str(open_entry.get("Company", "")).strip(),
+                "trips"   : completed_trips,
+            }
+        
+        else:
+            last = today_rows[-1]
+            return{
+                "state"   : "checked_out",
+                "in_time" : str(last.get("InTime", "")).strip(),
+                "out_time": str(last.get("OutTime", "")).strip(),
+                "company" : str(last.get("Company", "")).strip(),
+                "trips"   : completed_trips,
+            }
+
     except Exception:
-        return {"state": "none", "in_time": "", "out_time": "", "company": ""}
-    
+        return {"state": "none", "in_time": "", "out_time": "", "company": "", "trips": 0}
 
 
 
