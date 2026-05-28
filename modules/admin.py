@@ -982,7 +982,7 @@ def _show_salary_processing():
         try:
             bank_options = list(st.secrets["banks"]["accounts"])
         except Exception:
-            bank_options = ["FF/JSB", "M&RFSPL/UBI", "PTBS/UBI", "MCH", "AUSM/HDFC"]
+            bank_options = ["FF/JSB", "M&RFSPL/UBI", "PTBS/UBI", "MCHLLP/KOTAK", "MCHLLP/HDFC", "AUSM/HDFC", "MAJMUDAR", "OWFSPL/UBI", "FAPL/UBI", "VSPL/UBI", "MCO/KOTAK"]
         bank = st.selectbox("Pay From (Entity/Bank)", options=bank_options, key="sal_bank")
 
     st.markdown("---")
