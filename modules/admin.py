@@ -290,6 +290,7 @@ def _calculate_salary(
     base_salary: float,
     days_in_month: int,
     is_study_leave: bool,
+    is_article: bool = False
 ) -> dict:
     """
     Core salary formula. Returns a dict with all derived values.
@@ -305,8 +306,9 @@ def _calculate_salary(
             "deduction"     : 0.0,
             "salary_paid"   : 0.0,
         }
-
-    add_substract = b_forward + cl_pl + sunday_c_off - leave_availed
+    
+    effective_cl_pl = 0.0 if is_article else cl_pl
+    add_substract = b_forward + effective_cl_pl + sunday_c_off - leave_availed
 
     if add_substract >= 0:
         c_forward   = add_substract
@@ -1002,6 +1004,7 @@ def _show_salary_processing():
             base_salary    = base_salary,
             days_in_month  = days_in_month,
             is_study_leave = is_study_leave,
+            is_article = is_article
         )
 
         # ── Display the ledger row as a clean table ───────────────────────────
