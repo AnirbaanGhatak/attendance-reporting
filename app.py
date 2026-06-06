@@ -42,17 +42,46 @@ st.markdown(
 
 
 def main():
+
     init_session()
 
     if st.session_state.logged_in:
-        # ── Already logged in — route to the correct module ───────────────────
-        if st.session_state.user_role in ["employee", "article"]:
+        role = st.session_state.user_role
+
+        if role in ["employee", "article"]:
+            # Attendance only — no admin panel at all
             show_attendance_module()
-        elif st.session_state.user_role == "admin":
-            show_admin_module()
+
+        elif role in ["admin", "partner"]:
+            # Show both attendance and admin via sidebar
+            _show_authenticated_layout()
     else:
-        # ── Landing / login page ──────────────────────────────────────────────
         _show_landing()
+
+
+        
+def _show_authenticated_layout():
+    """
+    Authenticated layout for admin and partner.
+    Sidebar lets them switch between attendance and admin panel.
+    """
+    role = st.session_state.user_role
+    name = st.session_state.user_name
+
+    st.sidebar.title(f"👋 {name}")
+    st.sidebar.caption(f"Role: {role.capitalize()}")
+    st.sidebar.markdown("---")
+
+    section = st.sidebar.radio(
+        "Module",
+        ["📍 My Attendance", "🔧 Admin Panel"],
+    )
+
+    if section == "📍 My Attendance":
+        show_attendance_module()
+    else:
+        show_admin_module()
+
 
 
 def _show_landing():

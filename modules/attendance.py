@@ -13,43 +13,46 @@ Flow:
 import streamlit as st
 from streamlit_js_eval import get_geolocation
 
-from utils.auth import login_associate, logout, verify_admin
-from utils.gsheets import (
+from utils.auth import login_associate, logout
+from utils.database import (
     get_associate_names,
     verify_associate,
     mark_attendance,
     mark_checkout,
     get_today_status,
     fetch_users,
-    fetch_carry_forward
+    fetch_carry_forward,
+    fetch_user_by_name,
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public entry-point called by app.py
+# Public entry-point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_attendance_module():
-    """Renders the full attendance module (login + mark-attendance screen)."""
-    if not st.session_state.get("logged_in") or st.session_state.user_role not in ["article", "employee"]:
+    if (
+        not st.session_state.get("logged_in")
+        or st.session_state.user_role not in ["article", "employee", "partner", "admin"]
+    ):
         _show_associate_login()
     else:
         _show_mark_attendance()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Associate Login
+# Login
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _show_associate_login():
-    st.title("👤 Associate Login")
+    st.title("👤 Login")
     st.caption("Mark your out-office attendance")
     st.markdown("---")
 
     names = get_associate_names()
     if not names:
         st.warning(
-            "No associates found in the system. "
+            "No users found in the system. "
             "Ask your admin to add users via the Admin panel."
         )
         return
@@ -71,7 +74,9 @@ def _show_associate_login():
 
         with st.spinner("Verifying…"):
             if verify_associate(name, pin):
-                login_associate(name)
+                user = fetch_user_by_name(name)
+                role = user["role"] if user else "employee"
+                login_associate(name, role)
                 st.success(f"Welcome, {name}!")
                 st.rerun()
             else:
@@ -79,7 +84,7 @@ def _show_associate_login():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mark Attendance Screen
+# Mark Attendance
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _show_mark_attendance():
@@ -89,19 +94,16 @@ def _show_mark_attendance():
     today = datetime.date.today()
 
     st.title("📍 Attendance")
-    st.markdown(f"**Associate:** {name}")
+    st.markdown(f"**Name:** {name}")
     st.markdown(f"**Date:** {today.strftime('%A, %d %B %Y')}")
 
+    # ── Leave balance ─────────────────────────────────────────────────────────
     try:
         current_month = today.strftime("%Y-%m")
         leave_balance = fetch_carry_forward(name, current_month)
-        # current month's accrual isn't saved yet so add 1.5 as preview
-        try:
-            users    = fetch_users()
-            user_row = users[users["name"].str.strip().str.lower() == name.strip().lower()]
-            role     = user_row.iloc[0]["role"].strip().lower() if not user_row.empty else "employee"
-        except Exception:
-            role = "employee"
+
+        user = fetch_user_by_name(name)
+        role = user["role"].strip().lower() if user else "employee"
 
         if role == "article":
             st.info(
@@ -116,29 +118,28 @@ def _show_mark_attendance():
                 f"After this month's CL/PL: **{projected:.1f} days** *(estimated)*"
             )
     except Exception:
-        pass   # silently skip if ledger unavailable
-
+        pass
 
     st.markdown("---")
 
-    # Check today's status first
+    # ── Today's status ────────────────────────────────────────────────────────
     status = get_today_status(name)
     state  = status["state"]
 
     if state == "checked_out":
         trips = status.get("trips", 0)
         st.success(
-           f"✅ Last check-out recorded.  \n"
-           f"**Company:** {status['company']}  \n"
-           f"**In:** {status['in_time']}  |  **Out:** {status['out_time']}  \n"
-           f"**Trips completed today:** {trips}"
+            f"✅ Last check-out recorded.  \n"
+            f"**Company:** {status['company']}  \n"
+            f"**In:** {status['in_time']}  |  **Out:** {status['out_time']}  \n"
+            f"**Trips completed today:** {trips}"
         )
-        st.info("Going somewhere else? You can check in again below")
-        
+        st.info("Going somewhere else? You can check in again below.")
 
-    # Location (needed for check-in only)
+    # ── Location ──────────────────────────────────────────────────────────────
     if state == "none":
         st.info("📡 Fetching your location… Allow location access when prompted.")
+
     location = get_geolocation()
     lat, lon = None, None
     if location:
@@ -146,22 +147,23 @@ def _show_mark_attendance():
             lat = location["coords"]["latitude"]
             lon = location["coords"]["longitude"]
             acc = location["coords"].get("accuracy", "?")
-            st.success(f"📌 Location captured — Lat: `{lat:.5f}`, Lon: `{lon:.5f}` (±{acc:.0f} m)")
+            st.success(
+                f"📌 Location captured — "
+                f"Lat: `{lat:.5f}`, Lon: `{lon:.5f}` (±{acc:.0f} m)"
+            )
         except (KeyError, TypeError):
             st.warning("Location data incomplete. Refresh and allow location access.")
 
     st.markdown("---")
 
-    # ── CHECK IN ──────────────────────────────────────────────────────────────
+    # ── Check In ──────────────────────────────────────────────────────────────
     if state in ("none", "checked_out"):
         trips = status.get("trips", 0)
         label = "Check In Again" if state == "checked_out" else "Check In"
         st.subheader(f"{'🔄' if state == 'checked_out' else '📍'} {label}")
-
         if trips > 0:
             st.caption(f"Trip {trips + 1} today")
 
-        st.subheader("Check In")
         company = st.text_input(
             "Company / Client Office",
             placeholder="e.g. ABC Pvt. Ltd., Andheri",
@@ -176,7 +178,7 @@ def _show_mark_attendance():
                 type="primary",
             )
         with col2:
-            if st.button("Logout", use_container_width=True):
+            if st.button("Logout", use_container_width=True, key="logout_in"):
                 logout()
                 st.rerun()
 
@@ -192,7 +194,7 @@ def _show_mark_attendance():
             else:
                 st.error(result["message"])
 
-    # ── CHECK OUT ─────────────────────────────────────────────────────────────
+    # ── Check Out ─────────────────────────────────────────────────────────────
     elif state == "checked_in":
         trips = status.get("trips", 0)
         st.info(
@@ -201,6 +203,7 @@ def _show_mark_attendance():
             f"**Trips completed today:** {trips}"
         )
         st.subheader("Check Out")
+        st.caption("Your current location will be recorded as checkout location.")
 
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -210,7 +213,7 @@ def _show_mark_attendance():
                 type="primary",
             )
         with col2:
-            if st.button("Logout", use_container_width=True):
+            if st.button("Logout", use_container_width=True, key="logout_out"):
                 logout()
                 st.rerun()
 
@@ -220,9 +223,8 @@ def _show_mark_attendance():
             else:
                 with st.spinner("Saving…"):
                     result = mark_checkout(name, lat, lon)
-
-            if result["success"]:
-                st.success(result["message"])
-                st.rerun()
-            else:
-                st.error(result["message"])
+                if result["success"]:
+                    st.success(result["message"])
+                    st.rerun()
+                else:
+                    st.error(result["message"])

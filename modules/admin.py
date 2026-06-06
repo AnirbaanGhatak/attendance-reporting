@@ -334,16 +334,18 @@ def _calculate_salary(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_admin_module():
-    if not st.session_state.get("logged_in") or st.session_state.user_role != "admin":
+    if not st.session_state.get("logged_in") or \
+       st.session_state.user_role not in ["admin", "partner"]:
         _show_admin_login()
         return
 
-    st.sidebar.title("🔧 Admin Panel")
-    st.sidebar.markdown(f"Logged in as **{st.session_state.user_name}**")
-    page = st.sidebar.radio(
-        "Go to",
-        ["📊 Attendance Report", "💰 Salary Processing", "👥 Manage Users"],
-    )
+    role = st.session_state.user_role
+
+    # Build page list based on role
+    pages = ["📊 Attendance Report", "💰 Salary Processing", "👥 Manage Users"]
+
+    page = st.sidebar.radio("Go to", pages)
+
     if st.sidebar.button("Logout"):
         logout()
         st.rerun()
@@ -352,10 +354,9 @@ def show_admin_module():
     if page == "📊 Attendance Report":
         _show_attendance_consolidation()
     elif page == "💰 Salary Processing":
-        _show_salary_processing()
+        _show_salary_processing(role)
     elif page == "👥 Manage Users":
-        _show_user_management()
-
+        _show_user_management(role)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Admin Login
@@ -735,7 +736,7 @@ def _show_attendance_consolidation():
 # Phase B – Salary Processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _show_salary_processing():
+def _show_salary_processing(role: str = "admin"):
     st.title("💰 Salary Processing")
     st.markdown(
         "Upload the attendance XLS for an employee, review the auto-calculated "
@@ -973,11 +974,32 @@ def _show_salary_processing():
     st.subheader("4 — Salary & Bank")
 
     col_f, col_g = st.columns(2)
+# NEW
     with col_f:
-        base_salary = st.number_input(
-            "Base Salary (₹)", min_value=0.0, step=500.0,
-            value=0.0, format="%.2f", key="sal_base",
-        )
+        # Auto-load salary from user record
+        user_record    = fetch_user_by_name(employee)
+        stored_salary  = float(user_record.get("base_salary", 0.0)) if user_record else 0.0
+
+        if role == "partner":
+            # Partner can override the salary
+            base_salary = st.number_input(
+                "Base Salary (₹)",
+                min_value=0.0, step=500.0,
+                value=stored_salary,
+                format="%.2f",
+                key="sal_base",
+            )
+        else:
+            # Admin sees salary but cannot change it
+            base_salary = stored_salary
+            st.number_input(
+                "Base Salary (₹)",
+                value=stored_salary,
+                format="%.2f",
+                disabled=True,
+                key="sal_base",
+            )
+            st.caption("Only a partner can change the base salary.")
     with col_g:
         try:
             bank_options = list(st.secrets["banks"]["accounts"])
@@ -1219,16 +1241,27 @@ def _show_salary_processing():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _show_user_management():
-    st.title("👥 Manage Associates")
-    st.caption("Create login credentials for associates who mark out-office attendance.")
+    st.title("👥 Manage Users")
+    st.caption("Create and manage login credentials for all users.")
     st.markdown("---")
 
-    st.subheader("Add New Associate")
+    st.subheader("Add New User")
     with st.form("add_user_form"):
-        new_name  = st.text_input("Full Name", placeholder="e.g. Aparna Pradyot Maitra")
-        new_pin   = st.text_input("3-Digit PIN", type="password",
-                              max_chars=3, placeholder="• • •")
-        new_role  = st.selectbox("Role", options=["employee", "article", "partner", "admin"])
+        col1, col2 = st.columns(2)
+        with col1:
+            new_name  = st.text_input("Full Name", placeholder="e.g. Aparna Pradyot Maitra")
+            new_pin   = st.text_input("3-Digit PIN", type="password",
+                                      max_chars=3, placeholder="• • •")
+            new_role  = st.selectbox("Role", options=["employee", "article", "admin", "partner"])
+            new_email = st.text_input("Email Address", placeholder="e.g. aparna@office.com")
+        with col2:
+            new_salary           = st.number_input("Base Salary (₹)", min_value=0.0,
+                                                    step=500.0, format="%.2f")
+            new_process_salary   = st.toggle("Process Salary", value=True,
+                                              help="Include this person in salary processing")
+            new_track_attendance = st.toggle("Track Attendance", value=True,
+                                              help="Include this person in attendance login")
+
         submitted = st.form_submit_button("Add User", use_container_width=True)
 
     if submitted:
@@ -1237,22 +1270,59 @@ def _show_user_management():
         elif len(new_pin) != 3 or not new_pin.isdigit():
             st.error("PIN must be exactly 3 digits (numbers only).")
         else:
-            try:
-                add_user(new_name.strip(), new_pin.strip(), role=new_role)
-                role_label = {"article": "Article", "employee": "Employee", "admin": "Admin"}
-                st.success(f"✅ '{new_name.strip()}' added as {role_label.get(new_role, new_pin)}.")
-            except Exception as e:
-                st.error(f"Error: {e}")
+            result = add_user(
+                name             = new_name.strip(),
+                pin              = new_pin.strip(),
+                role             = new_role,
+                email            = new_email.strip(),
+                base_salary      = new_salary,
+                process_salary   = new_process_salary,
+                track_attendance = new_track_attendance,
+            )
+            if result["success"]:
+                st.success(result["message"])
+            else:
+                st.error(result["message"])
 
     st.markdown("---")
+
+    # ── View + Edit existing users ────────────────────────────────────────────
     st.subheader("Current Users")
     try:
         users = fetch_users()
         if users.empty:
             st.info("No users added yet.")
         else:
-            display = users[["name", "role"]].copy()
-            display.columns = ["Name", "Role"]
-            st.dataframe(display.reset_index(drop=True), use_container_width=True)
+            # Partner-only — salary edit
+            is_partner = st.session_state.get("user_role") == "partner"
+
+            for _, row in users.iterrows():
+                with st.expander(f"**{row['name']}** — {row['role']}"):
+                    c1, c2, c3 = st.columns(3)
+                    c1.markdown(f"**Email:** {row.get('email', '—')}")
+                    c2.markdown(f"**Salary:** ₹{float(row.get('base_salary', 0)):,.2f}")
+                    c3.markdown(
+                        f"**Salary Processing:** {'✅' if row.get('process_salary') else '❌'}  \n"
+                        f"**Attendance:** {'✅' if row.get('track_attendance') else '❌'}"
+                    )
+
+                    # Partner can edit salary
+                    if is_partner:
+                        with st.form(f"edit_salary_{row['name']}"):
+                            new_sal = st.number_input(
+                                "Update Base Salary (₹)",
+                                value=float(row.get("base_salary", 0)),
+                                step=500.0,
+                                format="%.2f",
+                                key=f"sal_edit_{row['name']}",
+                            )
+                            if st.form_submit_button("Update Salary",
+                                                      use_container_width=True):
+                                result = update_user_salary(row["name"], new_sal)
+                                if result["success"]:
+                                    st.success(result["message"])
+                                else:
+                                    st.error(result["message"])
+
     except Exception as e:
-        st.error(f"Could not load users: {e}")  
+        st.error(f"Could not load users: {e}") 
