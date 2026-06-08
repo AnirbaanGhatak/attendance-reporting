@@ -17,7 +17,7 @@ Supabase tables:
                               "Present" for all out-office rows
 
     salary_ledger   – id | employee | month | b_forward | cl_pl |
-                      sunday_c_off | leave_availed | add_substract |
+                      sunday_c_off | leave_availed | add_subtract |
                       c_forward | base_salary | days_in_month |
                       deduction | salary_paid | bank |
                       is_study_leave | saved_at
@@ -440,12 +440,19 @@ def save_in_office_attendance(rows: list[dict]) -> dict:
             if key in existing_set:
                 skipped += 1
                 continue
+            def _clean_time(val) -> str | None:
+                """Return None for empty/nan time values, string otherwise."""
+                s = str(val).strip() if val is not None else ""
+                if not s or s.lower() == "nan" or s == "":
+                    return None
+                return s
+
             to_insert.append({
                 "name"    : str(row["name"]).strip(),
                 "date"    : str(row["date"]).strip(),
                 "company" : "",
-                "in_time" : str(row.get("in_time",  "") or ""),
-                "out_time": str(row.get("out_time", "") or ""),
+                "in_time" : _clean_time(row.get("in_time")),
+                "out_time": _clean_time(row.get("out_time")),
                 "in_latitude"  : None,
                 "in_longitude" : None,
                 "out_latitude" : None,
@@ -582,7 +589,8 @@ def fetch_carry_forward(employee: str, month: str) -> float:
         if res.data:
             return float(res.data[0].get("c_forward", 0.0) or 0.0)
         return 0.0
-    except Exception:
+    except Exception as e:
+        st.warning(f"Could not fetch carry-forward for {employee}: {e}")
         return 0.0
 
 
@@ -607,7 +615,7 @@ def save_salary_ledger_row(
     cl_pl: float,
     sunday_c_off: float,
     leave_availed: float,
-    add_substract: float,
+    add_subtract: float,
     c_forward: float,
     base_salary: float,
     days_in_month: int,
@@ -639,7 +647,7 @@ def save_salary_ledger_row(
             "cl_pl"         : cl_pl,
             "sunday_c_off"  : sunday_c_off,
             "leave_availed" : leave_availed,
-            "add_substract" : add_substract,
+            "add_subtract" : add_subtract,
             "c_forward"     : c_forward,
             "base_salary"   : base_salary,
             "days_in_month" : days_in_month,

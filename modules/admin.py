@@ -368,20 +368,20 @@ def _calculate_salary(
     if is_study_leave:
         return {
             "b_forward": b_forward, "cl_pl": 0.0, "sunday_c_off": 0.0,
-            "leave_availed": 0.0, "add_substract": b_forward,
+            "leave_availed": 0.0, "add_subtract": b_forward,
             "c_forward": b_forward, "deduction": 0.0, "salary_paid": 0.0,
         }
-    add_substract = b_forward + cl_pl + sunday_c_off - leave_availed
-    if add_substract >= 0:
+    add_subtract = b_forward + cl_pl + sunday_c_off - leave_availed
+    if add_subtract >= 0:
         return {
             "b_forward": b_forward, "cl_pl": cl_pl, "sunday_c_off": sunday_c_off,
-            "leave_availed": leave_availed, "add_substract": add_substract,
-            "c_forward": add_substract, "deduction": 0.0, "salary_paid": base_salary,
+            "leave_availed": leave_availed, "add_subtract": add_subtract,
+            "c_forward": add_subtract, "deduction": 0.0, "salary_paid": base_salary,
         }
-    deduction = (base_salary / days_in_month) * abs(add_substract)
+    deduction = (base_salary / days_in_month) * abs(add_subtract)
     return {
         "b_forward": b_forward, "cl_pl": cl_pl, "sunday_c_off": sunday_c_off,
-        "leave_availed": leave_availed, "add_substract": add_substract,
+        "leave_availed": leave_availed, "add_subtract": add_subtract,
         "c_forward": 0.0, "deduction": deduction, "salary_paid": base_salary - deduction,
     }
 
@@ -504,6 +504,9 @@ def _show_attendance_consolidation():
         st.write(f"**{len(parsed_dict)} employee(s) found in file**")
         st.markdown("---")
 
+        # Build a lowercase set of system names for fast matching
+        system_name_set = {n.strip().lower() for n in fetch_all_employee_names()}
+
         for xls_name, parsed in parsed_dict.items():
             month_rows = parsed[
                 parsed["Date"].str.startswith(month_str, na=False)
@@ -526,7 +529,14 @@ def _show_attendance_consolidation():
                 )
                 st.session_state.att_name_map[xls_name] = chosen
 
-            final_name                  = xls_name if chosen == "— same as file —" else chosen
+            final_name = xls_name if chosen == "— same as file —" else chosen
+
+            # Skip employees not in the system (no longer employed / not tracked)
+            if final_name.strip().lower() not in system_name_set:
+                st.caption(f"⏭️ **{final_name}** — not found in system. Will be skipped.")
+                st.markdown("---")
+                continue
+
             month_rows["Employee_Name"] = final_name
             working_days                = month_rows["Days_Count"].sum()
             st.success(
@@ -545,22 +555,29 @@ def _show_attendance_consolidation():
     st.subheader("Step 2 — Save to Supabase")
 
     if not in_office_df.empty:
+        emp_count = in_office_df["Employee_Name"].nunique()
         st.caption(
-            f"This will insert **{len(in_office_df)} in-office row(s)** for "
-            f"**{month_label}** into the attendance table. "
-            "Rows that already exist (same employee + date) will be skipped automatically."
+            f"**{emp_count} employee(s)** matched to system  |  "
+            f"**{len(in_office_df)} row(s)** for **{month_label}**  |  "
+            "Employees not in the system have already been excluded. "
+            "Rows that already exist in Supabase will be skipped automatically."
         )
 
         if st.button("💾 Save In-Office Attendance", type="primary", use_container_width=True):
-            # Build the list of dicts for save_in_office_attendance
+
+            def _clean_time(val) -> str:
+                """Return empty string for nan/None time values."""
+                s = str(val).strip() if val is not None else ""
+                return "" if (not s or s.lower() == "nan") else s
+
             rows_to_save = []
             for _, row in in_office_df.iterrows():
                 rows_to_save.append({
                     "name"    : str(row["Employee_Name"]),
                     "date"    : str(row["Date"]),
-                    "in_time" : str(row.get("InTime",  "") or ""),
-                    "out_time": str(row.get("OutTime", "") or ""),
-                    "status"  : str(row.get("Status",  "Present") or "Present"),
+                    "in_time" : _clean_time(row.get("InTime")),
+                    "out_time": _clean_time(row.get("OutTime")),
+                    "status"  : str(row.get("Status", "Present") or "Present"),
                 })
 
             with st.spinner("Saving to Supabase…"):
@@ -789,7 +806,7 @@ def _show_salary_ledger():
             cl_pl         = float(row.get("cl_pl",        0) or 0)
             sunday_c_off  = float(row.get("sunday_c_off", 0) or 0)
             leave_availed = float(row.get("leave_availed",0) or 0)
-            add_sub       = float(row.get("add_substract",0) or 0)
+            add_sub       = float(row.get("add_subtract",0) or 0)
             c_forward     = float(row.get("c_forward",    0) or 0)
             bank          = str(row.get("bank",           "") or "")
             study_leave   = bool(row.get("is_study_leave", False))
@@ -983,8 +1000,11 @@ def _show_salary_processing():
     st.markdown("---")
 
     for key, default in [
-        ("sal_split_count", 0), ("sal_calc_result", None),
-        ("sal_xls_df", None),   ("sal_xls_employee", ""),
+        ("sal_split_count",    0),
+        ("sal_calc_result",    None),
+        ("sal_xls_df",         None),
+        ("sal_xls_employee",   ""),
+        ("sal_last_selection", ""),   # tracks employee|month to detect real changes
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -1042,6 +1062,12 @@ def _show_salary_processing():
     auto_leave_availed = 0.0
     auto_sunday_c_off  = 0.0
 
+    # Only re-fetch and re-seed when employee or month actually changes.
+    # Without this guard, every widget interaction triggers a rerun which
+    # re-seeds session state and resets any manual edits the partner made.
+    current_selection = f"{employee}|{month_str}"
+    selection_changed = st.session_state.get("sal_last_selection") != current_selection
+
     with st.spinner(f"Fetching attendance for {employee} — {month_label}…"):
         month_df = _build_salary_attendance(employee, month_str)
 
@@ -1054,9 +1080,12 @@ def _show_salary_processing():
         auto_leave_availed = _auto_leave_availed(month_df)
         auto_sunday_c_off  = _auto_sunday_c_off(month_df)
 
-        st.session_state["sal_leave_availed"] = float(auto_leave_availed)
-        st.session_state["sal_sc_off_base"]   = float(auto_sunday_c_off)
-        st.session_state["sal_extra_adj"]     = 0.0
+        # Only overwrite session state if employee/month changed — not on every rerun
+        if selection_changed:
+            st.session_state["sal_leave_availed"] = float(auto_leave_availed)
+            st.session_state["sal_sc_off_base"]   = float(auto_sunday_c_off)
+            st.session_state["sal_extra_adj"]     = 0.0
+            st.session_state["sal_last_selection"] = current_selection
 
         st.success(
             f"✅ **{employee}** — {len(month_df)} day(s) found  |  "
@@ -1093,6 +1122,10 @@ def _show_salary_processing():
         st.info("Study Leave month — all leave fields zeroed. Only B/Forward carries through.")
 
     b_forward_auto = fetch_carry_forward(employee, month_str)
+
+    # Only pre-seed b_forward when employee/month changes, not on every rerun
+    if selection_changed:
+        st.session_state["sal_b_forward"] = float(b_forward_auto)
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -1145,6 +1178,9 @@ def _show_salary_processing():
     with col_f:
         user_record   = fetch_user_by_name(employee)
         stored_salary = float(user_record.get("base_salary", 0.0)) if user_record else 0.0
+        # Pre-seed only when employee/month changes, same guard as leave parameters
+        if selection_changed:
+            st.session_state["sal_base"] = stored_salary
         base_salary   = st.number_input(
             "Base Salary (₹)", min_value=0.0, step=500.0,
             value=stored_salary, format="%.2f", key="sal_base",
@@ -1176,7 +1212,7 @@ def _show_salary_processing():
                 "Value": [
                     f"{result['b_forward']:.1f} days", f"{result['cl_pl']:.1f} days",
                     f"{result['sunday_c_off']:.1f} days", f"{result['leave_availed']:.1f} days",
-                    f"{result['add_substract']:.1f} days", f"{result['c_forward']:.1f} days",
+                    f"{result['add_subtract']:.1f} days", f"{result['c_forward']:.1f} days",
                     f"₹{base_salary:,.2f}", f"₹{result['deduction']:,.2f}", f"₹{result['salary_paid']:,.2f}",
                 ],
             }),
@@ -1184,12 +1220,12 @@ def _show_salary_processing():
         )
         if is_study_leave:
             st.info("📚 Study Leave — no salary paid. Balance carries through.")
-        elif result["add_substract"] >= 0:
-            st.success(f"✅ No deduction — **{result['add_substract']:.1f} days** carry forward.")
+        elif result["add_subtract"] >= 0:
+            st.success(f"✅ No deduction — **{result['add_subtract']:.1f} days** carry forward.")
         else:
             st.error(
                 f"⚠️ Deduction of **₹{result['deduction']:,.2f}** applied. "
-                f"({base_salary:,.0f} ÷ {days_in_month} × {abs(result['add_substract']):.1f})"
+                f"({base_salary:,.0f} ÷ {days_in_month} × {abs(result['add_subtract']):.1f})"
             )
         st.session_state.sal_calc_result = result
     else:
@@ -1267,7 +1303,7 @@ def _show_salary_processing():
                 employee=employee, month=month_str,
                 b_forward=result["b_forward"], cl_pl=result["cl_pl"],
                 sunday_c_off=result["sunday_c_off"], leave_availed=result["leave_availed"],
-                add_substract=result["add_substract"], c_forward=result["c_forward"],
+                add_subtract=result["add_subtract"], c_forward=result["c_forward"],
                 base_salary=base_salary, days_in_month=days_in_month,
                 deduction=result["deduction"], salary_paid=result["salary_paid"],
                 bank=bank, is_study_leave=is_study_leave,

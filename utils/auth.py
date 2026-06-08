@@ -38,8 +38,9 @@ def logout():
     show_payslip is explicitly reset so the next user who logs in on the
     same browser session does not inherit the previous user's payslip view.
     """
-    st.session_state.logged_in       = False
-    st.session_state.user_role       = None
-    st.session_state.user_name       = None
-    st.session_state.sal_split_count = 0
-    st.session_state.show_payslip    = False
+    st.session_state.logged_in          = False
+    st.session_state.user_role          = None
+    st.session_state.user_name          = None
+    st.session_state.sal_split_count    = 0
+    st.session_state.show_payslip       = False
+    st.session_state.sal_last_selection = ""
