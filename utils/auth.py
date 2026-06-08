@@ -9,39 +9,38 @@ import streamlit as st
 
 def init_session():
     defaults = {
-        "logged_in": False,
-        "user_role": None,          # "associate" | "admin"
-        "user_name": None,
-        "split_count": 0,
+        "logged_in"      : False,
+        "user_role"      : None,
+        "user_name"      : None,
+        "sal_split_count": 0,
+        "show_payslip"   : False,   # payslip view toggle in attendance module
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
-def login_associate(name: str, role:str = "article"):
+def login_associate(name: str, role: str = "employee"):
     st.session_state.logged_in = True
     st.session_state.user_role = role
     st.session_state.user_name = name
 
 
-def login_admin(name: str):
+def login_admin(name: str, role: str = "admin"):
     st.session_state.logged_in = True
-    st.session_state.user_role = "admin"
+    st.session_state.user_role = role
     st.session_state.user_name = name
 
 
 def logout():
-    for key in ["logged_in", "user_role", "user_name", "split_count"]:
-        st.session_state[key] = None if key != "split_count" else 0
-    st.session_state.logged_in = False
-
-
-def verify_admin(username: str, password: str) -> bool:
-    try:
-        return (
-            username.strip() == st.secrets["admin"]["username"]
-            and password.strip() == st.secrets["admin"]["password"]
-        )
-    except Exception:
-        return False
+    """
+    Clear all session state on logout.
+    show_payslip is explicitly reset so the next user who logs in on the
+    same browser session does not inherit the previous user's payslip view.
+    """
+    st.session_state.logged_in          = False
+    st.session_state.user_role          = None
+    st.session_state.user_name          = None
+    st.session_state.sal_split_count    = 0
+    st.session_state.show_payslip       = False
+    st.session_state.sal_last_selection = ""

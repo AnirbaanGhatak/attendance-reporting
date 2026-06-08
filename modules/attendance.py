@@ -4,59 +4,71 @@ modules/attendance.py
 Module 1 – Out-Office Attendance for Associates.
 
 Flow:
-  1. Associate selects their name and enters 3-digit PIN → verified against GSheets.
+  1. Associate selects their name and enters 3-digit PIN → verified against Supabase.
   2. On success, "Mark Attendance" page is shown.
   3. Browser Geolocation API fires (requires HTTPS in production).
-  4. On button click: date = today, time = now, coords from JS → appended to GSheets.
+  4. On button click: date = today, time = now (IST), coords from JS → saved to Supabase.
+  5. Associates can check in/out multiple times per day (multiple trips).
+  6. Payslip button opens a styled payslip page for any processed month.
 """
+
+import base64
+import calendar as _cal
+import os
+from datetime import datetime, date
 
 import streamlit as st
 from streamlit_js_eval import get_geolocation
 
-from utils.auth import login_associate, logout, verify_admin
-from utils.gsheets import (
+from utils.auth import login_associate, logout
+from utils.database import (
     get_associate_names,
     verify_associate,
     mark_attendance,
     mark_checkout,
     get_today_status,
     fetch_users,
-    fetch_carry_forward
+    fetch_carry_forward,
+    fetch_user_by_name,
+    fetch_salary_ledger,
+    fetch_salary_splits,
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public entry-point called by app.py
+# Public entry-point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_attendance_module():
-    """Renders the full attendance module (login + mark-attendance screen)."""
-    if not st.session_state.get("logged_in") or st.session_state.user_role not in ["article", "employee"]:
+    if (
+        not st.session_state.get("logged_in")
+        or st.session_state.user_role not in ("article", "employee", "partner", "admin")
+    ):
         _show_associate_login()
     else:
         _show_mark_attendance()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Associate Login
+# Login
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _show_associate_login():
-    st.title("👤 Associate Login")
+    st.title("👤 Login")
     st.caption("Mark your out-office attendance")
     st.markdown("---")
 
     names = get_associate_names()
     if not names:
         st.warning(
-            "No associates found in the system. "
+            "No users found in the system. "
             "Ask your admin to add users via the Admin panel."
         )
         return
 
     with st.form("associate_login_form"):
-        name = st.selectbox("Select Your Name", options=names)
-        pin  = st.text_input(
+        name      = st.selectbox("Select Your Name", options=names)
+        pin       = st.text_input(
             "Enter 3-Digit PIN",
             type="password",
             max_chars=3,
@@ -71,7 +83,9 @@ def _show_associate_login():
 
         with st.spinner("Verifying…"):
             if verify_associate(name, pin):
-                login_associate(name)
+                user = fetch_user_by_name(name)
+                role = user["role"] if user else "employee"
+                login_associate(name, role)
                 st.success(f"Welcome, {name}!")
                 st.rerun()
             else:
@@ -79,29 +93,304 @@ def _show_associate_login():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mark Attendance Screen
+# Payslip
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_payslip(name: str):
+    """
+    Payslip viewer for the logged-in employee.
+
+    - Month selector capped at current month
+    - Pulls salary_ledger + salary_splits from Supabase
+    - Graceful "no data" message if month not processed
+    - Firm logo from assets/logo.png (falls back to text if missing)
+    - Rendered via st.components.v1.html to avoid Streamlit markdown interference
+    - Print-to-PDF via browser Ctrl+P / ⌘P
+    """
+    import streamlit.components.v1 as components
+
+    st.markdown("---")
+    st.subheader("🧾 Payslip")
+
+    # ── Month selector ────────────────────────────────────────────────────────
+    now = datetime.now()
+    col1, col2 = st.columns(2)
+    with col1:
+        year_opts = list(range(2023, now.year + 1))
+        sel_year  = st.selectbox(
+            "Year",
+            options=year_opts,
+            index=len(year_opts) - 1,
+            key="ps_year",
+        )
+    with col2:
+        max_month  = now.month if sel_year == now.year else 12
+        month_opts = list(range(1, max_month + 1))
+        sel_month  = st.selectbox(
+            "Month",
+            options=month_opts,
+            format_func=lambda m: datetime(2000, m, 1).strftime("%B"),
+            index=len(month_opts) - 1,
+            key="ps_month",
+        )
+
+    month_str   = f"{sel_year}-{sel_month:02d}"
+    month_label = datetime(sel_year, sel_month, 1).strftime("%B %Y")
+
+    # ── Fetch ledger data ─────────────────────────────────────────────────────
+    ledger_df = fetch_salary_ledger(employee=name)
+
+    if ledger_df.empty:
+        st.info(f"No payslip records found for **{name}** yet.")
+        return
+
+    row_match = ledger_df[ledger_df["month"] == month_str]
+    if row_match.empty:
+        st.info(
+            f"No payslip record found for **{month_label}**.  \n"
+            "This month may not have been processed yet, or you may have selected "
+            "a future month."
+        )
+        return
+
+    row = row_match.iloc[0]
+
+    # ── Fetch splits ──────────────────────────────────────────────────────────
+    splits_df = fetch_salary_splits(employee=name, month=month_str)
+
+    # ── Logo ──────────────────────────────────────────────────────────────────
+    # Resolves to <repo_root>/assets/logo.png
+    logo_path = os.path.join(
+        os.path.dirname(__file__), "..", "assets", "logo.png"
+    )
+    logo_b64 = ""
+    if os.path.exists(logo_path):
+        with open(logo_path, "rb") as f:
+            logo_b64 = base64.b64encode(f.read()).decode()
+
+    logo_html = (
+        f'<img src="data:image/png;base64,{logo_b64}" '
+        f'style="max-height:72px; object-fit:contain;" />'
+        if logo_b64
+        else '<div style="font-size:1.2rem;font-weight:700;color:#1e3a5f;">Maitra &amp; Chopra</div>'
+    )
+
+    # ── Values ────────────────────────────────────────────────────────────────
+    base_salary = float(row.get("base_salary",  0) or 0)
+    deduction   = float(row.get("deduction",    0) or 0)
+    salary_paid = float(row.get("salary_paid",  0) or 0)
+    bank        = str(row.get("bank",           "") or "")
+    study_leave = bool(row.get("is_study_leave", False))
+
+    study_badge = (
+        '<span style="background:#fef3c7;color:#92400e;padding:3px 10px;'
+        'border-radius:4px;font-size:0.78rem;font-weight:600;'
+        'letter-spacing:0.03em;">STUDY LEAVE</span>'
+        if study_leave else ""
+    )
+
+    deduction_color = "#dc2626" if deduction > 0 else "#374151"
+    deduction_prefix = "− " if deduction > 0 else ""
+
+    # ── Splits table HTML ─────────────────────────────────────────────────────
+    splits_section_html = ""
+    if not splits_df.empty:
+        split_rows_html = ""
+        for _, sp in splits_df.iterrows():
+            r_name   = str(sp.get("recipient_name",   "") or "")
+            r_amount = float(sp.get("recipient_amount", 0) or 0)
+            r_bank   = str(sp.get("bank",              "") or "")
+            split_rows_html += f"""
+              <tr style="border-top:1px solid #f3f4f6;">
+                <td style="padding:7px 10px;">{r_name}</td>
+                <td style="padding:7px 10px;text-align:right;">₹{r_amount:,.2f}</td>
+                <td style="padding:7px 10px;color:#6b7280;">{r_bank}</td>
+              </tr>"""
+
+        splits_section_html = (
+            "<tr>"
+            "<td colspan='2' style='padding:18px 0 6px 0;'>"
+            "<span style='font-weight:600;font-size:0.9rem;color:#374151;"
+            "text-transform:uppercase;letter-spacing:0.05em;'>Payment Breakdown</span>"
+            "</td>"
+            "</tr>"
+            "<tr>"
+            "<td colspan='2' style='padding:0 0 4px 0;'>"
+            "<table style='width:100%;border-collapse:collapse;"
+            "border:1px solid #e5e7eb;border-radius:6px;"
+            "overflow:hidden;font-size:0.88rem;'>"
+            "<thead>"
+            "<tr style='background:#f9fafb;'>"
+            "<th style='padding:7px 10px;text-align:left;font-weight:600;color:#374151;'>Recipient</th>"
+            "<th style='padding:7px 10px;text-align:right;font-weight:600;color:#374151;'>Amount</th>"
+            "<th style='padding:7px 10px;text-align:left;font-weight:600;color:#374151;'>Bank / Account</th>"
+            "</tr>"
+            "</thead>"
+            f"<tbody>{split_rows_html}</tbody>"
+            "</table>"
+            "</td>"
+            "</tr>"
+        )
+
+    # ── Full payslip HTML ─────────────────────────────────────────────────────
+    # No HTML comments — they cause Streamlit's markdown parser to render raw text.
+    # Rendered via components.html which bypasses the markdown parser entirely.
+    payslip_html = (
+        "<div style='"
+        "font-family:Segoe UI,Arial,sans-serif;"
+        "max-width:620px;"
+        "margin:8px auto 24px auto;"
+        "border:1px solid #d1d5db;"
+        "border-radius:12px;"
+        "overflow:hidden;"
+        "box-shadow:0 2px 12px rgba(0,0,0,0.09);"
+        "'>"
+
+        # Header
+        "<div style='"
+        "background:#dbeafe;"
+        "padding:20px 28px;"
+        "display:flex;"
+        "align-items:center;"
+        "justify-content:space-between;"
+        "border-bottom:2px solid #93c5fd;"
+        "'>"
+        f"<div>{logo_html}</div>"
+        "<div style='text-align:right;'>"
+        "<div style='color:#1e40af;font-size:0.72rem;letter-spacing:0.08em;"
+        "text-transform:uppercase;margin-bottom:3px;'>Salary Payslip</div>"
+        f"<div style='color:#1e3a5f;font-size:1.05rem;font-weight:700;'>{month_label}</div>"
+        "</div>"
+        "</div>"
+
+        # Employee bar
+        "<div style='"
+        "background:#f8fafc;"
+        "border-bottom:1px solid #e5e7eb;"
+        "padding:14px 28px;"
+        "display:flex;"
+        "align-items:center;"
+        "justify-content:space-between;"
+        "'>"
+        "<div>"
+        "<div style='font-size:0.7rem;color:#9ca3af;text-transform:uppercase;"
+        "letter-spacing:0.07em;margin-bottom:3px;'>Employee</div>"
+        f"<div style='font-weight:600;font-size:0.98rem;color:#111827;'>{name}</div>"
+        "</div>"
+        f"<div>{study_badge}</div>"
+        "</div>"
+
+        # Salary table
+        "<div style='padding:20px 28px;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:0.93rem;'>"
+        "<colgroup>"
+        "<col style='width:55%'>"
+        "<col style='width:45%'>"
+        "</colgroup>"
+
+        # Base Salary row
+        "<tr style='border-bottom:1px solid #f3f4f6;'>"
+        "<td style='padding:11px 0;color:#374151;'>Base Salary</td>"
+        f"<td style='padding:11px 0;text-align:right;font-weight:500;color:#111827;'>&#8377;{base_salary:,.2f}</td>"
+        "</tr>"
+
+        # Deduction row
+        "<tr style='border-bottom:1px solid #f3f4f6;'>"
+        "<td style='padding:11px 0;color:#374151;'>Deduction</td>"
+        f"<td style='padding:11px 0;text-align:right;font-weight:500;color:{deduction_color};'>"
+        f"{deduction_prefix}&#8377;{deduction:,.2f}</td>"
+        "</tr>"
+
+        # Net Salary Paid row
+        "<tr style='border-bottom:2px solid #1e40af;'>"
+        "<td style='padding:13px 0;font-weight:700;font-size:0.98rem;color:#111827;'>Net Salary Paid</td>"
+        f"<td style='padding:13px 0;text-align:right;font-weight:700;font-size:0.98rem;color:#1e40af;'>"
+        f"&#8377;{salary_paid:,.2f}</td>"
+        "</tr>"
+
+        # Paid From row
+        "<tr style='border-bottom:1px solid #f3f4f6;'>"
+        "<td style='padding:11px 0;color:#374151;'>Paid From</td>"
+        f"<td style='padding:11px 0;text-align:right;color:#374151;'>{bank}</td>"
+        "</tr>"
+
+        + splits_section_html +
+
+        "</table>"
+        "</div>"
+
+        # Footer
+        "<div style='"
+        "background:#f8fafc;"
+        "border-top:1px solid #e5e7eb;"
+        "padding:11px 28px;"
+        "font-size:0.72rem;"
+        "color:#9ca3af;"
+        "text-align:center;"
+        "'>"
+        "System-generated payslip &nbsp;|&nbsp; For queries contact your admin"
+        f"&nbsp;|&nbsp; Generated {datetime.now().strftime('%d %b %Y')}"
+        "</div>"
+
+        "</div>"
+    )
+
+    # ── Standalone HTML for download ─────────────────────────────────────────
+    # Wraps the payslip in a full HTML document so it renders correctly
+    # when opened in a browser and printed to PDF via Ctrl+P / ⌘P
+    standalone_html = (
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<title>Payslip - " + name + " - " + month_label + "</title>"
+        "<style>"
+        "body{margin:0;padding:24px;background:#f1f5f9;font-family:Segoe UI,Arial,sans-serif;}"
+        "@media print{"
+        "body{background:#fff;padding:0;}"
+        ".no-print{display:none;}"
+        "}"
+        "</style></head><body>"
+        "<div class='no-print' style='text-align:center;margin-bottom:16px;'>"
+        "<button onclick='window.print()' style='"
+        "background:#1e40af;color:#fff;border:none;padding:10px 28px;"
+        "border-radius:6px;font-size:1rem;cursor:pointer;'>"
+        "&#128438; Print / Save as PDF"
+        "</button>"
+        "</div>"
+        + payslip_html +
+        "</body></html>"
+    )
+
+    # ── Render inline preview ─────────────────────────────────────────────────
+    components.html(payslip_html, height=520, scrolling=True)
+
+    # ── Download button ───────────────────────────────────────────────────────
+    st.download_button(
+        label="⬇️ Download Payslip",
+        data=standalone_html.encode("utf-8"),
+        file_name=f"payslip_{name.replace(' ', '_')}_{month_str}.html",
+        mime="text/html",
+        use_container_width=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mark Attendance
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _show_mark_attendance():
-    import datetime
-
     name  = st.session_state.user_name
-    today = datetime.date.today()
+    today = date.today()
 
     st.title("📍 Attendance")
-    st.markdown(f"**Associate:** {name}")
+    st.markdown(f"**Name:** {name}")
     st.markdown(f"**Date:** {today.strftime('%A, %d %B %Y')}")
 
+    # ── Leave balance ─────────────────────────────────────────────────────────
     try:
         current_month = today.strftime("%Y-%m")
         leave_balance = fetch_carry_forward(name, current_month)
-        # current month's accrual isn't saved yet so add 1.5 as preview
-        try:
-            users    = fetch_users()
-            user_row = users[users["name"].str.strip().str.lower() == name.strip().lower()]
-            role     = user_row.iloc[0]["role"].strip().lower() if not user_row.empty else "employee"
-        except Exception:
-            role = "employee"
+
+        user = fetch_user_by_name(name)
+        role = user["role"].strip().lower() if user else "employee"
 
         if role == "article":
             st.info(
@@ -116,29 +405,43 @@ def _show_mark_attendance():
                 f"After this month's CL/PL: **{projected:.1f} days** *(estimated)*"
             )
     except Exception:
-        pass   # silently skip if ledger unavailable
+        pass
 
+    # ── Payslip ───────────────────────────────────────────────────────────────
+    if "show_payslip" not in st.session_state:
+        st.session_state["show_payslip"] = False
+
+    if st.button("🧾 View Payslip", use_container_width=True):
+        st.session_state["show_payslip"] = True
+        st.rerun()
+
+    if st.session_state.get("show_payslip"):
+        _show_payslip(name)
+        if st.button("← Back to Attendance", key="payslip_back"):
+            st.session_state["show_payslip"] = False
+            st.rerun()
+        return  # don't render attendance UI while payslip is open
 
     st.markdown("---")
 
-    # Check today's status first
+    # ── Today's status ────────────────────────────────────────────────────────
     status = get_today_status(name)
     state  = status["state"]
 
     if state == "checked_out":
         trips = status.get("trips", 0)
         st.success(
-           f"✅ Last check-out recorded.  \n"
-           f"**Company:** {status['company']}  \n"
-           f"**In:** {status['in_time']}  |  **Out:** {status['out_time']}  \n"
-           f"**Trips completed today:** {trips}"
+            f"✅ Last check-out recorded.  \n"
+            f"**Company:** {status['company']}  \n"
+            f"**In:** {status['in_time']}  |  **Out:** {status['out_time']}  \n"
+            f"**Trips completed today:** {trips}"
         )
-        st.info("Going somewhere else? You can check in again below")
-        
+        st.info("Going somewhere else? You can check in again below.")
 
-    # Location (needed for check-in only)
+    # ── Location ──────────────────────────────────────────────────────────────
     if state == "none":
         st.info("📡 Fetching your location… Allow location access when prompted.")
+
     location = get_geolocation()
     lat, lon = None, None
     if location:
@@ -146,22 +449,23 @@ def _show_mark_attendance():
             lat = location["coords"]["latitude"]
             lon = location["coords"]["longitude"]
             acc = location["coords"].get("accuracy", "?")
-            st.success(f"📌 Location captured — Lat: `{lat:.5f}`, Lon: `{lon:.5f}` (±{acc:.0f} m)")
+            st.success(
+                f"📌 Location captured — "
+                f"Lat: `{lat:.5f}`, Lon: `{lon:.5f}` (±{acc:.0f} m)"
+            )
         except (KeyError, TypeError):
             st.warning("Location data incomplete. Refresh and allow location access.")
 
     st.markdown("---")
 
-    # ── CHECK IN ──────────────────────────────────────────────────────────────
+    # ── Check In ──────────────────────────────────────────────────────────────
     if state in ("none", "checked_out"):
         trips = status.get("trips", 0)
         label = "Check In Again" if state == "checked_out" else "Check In"
         st.subheader(f"{'🔄' if state == 'checked_out' else '📍'} {label}")
-
         if trips > 0:
             st.caption(f"Trip {trips + 1} today")
 
-        st.subheader("Check In")
         company = st.text_input(
             "Company / Client Office",
             placeholder="e.g. ABC Pvt. Ltd., Andheri",
@@ -176,7 +480,7 @@ def _show_mark_attendance():
                 type="primary",
             )
         with col2:
-            if st.button("Logout", use_container_width=True):
+            if st.button("Logout", use_container_width=True, key="logout_in"):
                 logout()
                 st.rerun()
 
@@ -192,7 +496,7 @@ def _show_mark_attendance():
             else:
                 st.error(result["message"])
 
-    # ── CHECK OUT ─────────────────────────────────────────────────────────────
+    # ── Check Out ─────────────────────────────────────────────────────────────
     elif state == "checked_in":
         trips = status.get("trips", 0)
         st.info(
@@ -201,6 +505,7 @@ def _show_mark_attendance():
             f"**Trips completed today:** {trips}"
         )
         st.subheader("Check Out")
+        st.caption("Your current location will be recorded as checkout location.")
 
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -210,7 +515,7 @@ def _show_mark_attendance():
                 type="primary",
             )
         with col2:
-            if st.button("Logout", use_container_width=True):
+            if st.button("Logout", use_container_width=True, key="logout_out"):
                 logout()
                 st.rerun()
 
@@ -220,9 +525,8 @@ def _show_mark_attendance():
             else:
                 with st.spinner("Saving…"):
                     result = mark_checkout(name, lat, lon)
-
-            if result["success"]:
-                st.success(result["message"])
-                st.rerun()
-            else:
-                st.error(result["message"])
+                if result["success"]:
+                    st.success(result["message"])
+                    st.rerun()
+                else:
+                    st.error(result["message"])
