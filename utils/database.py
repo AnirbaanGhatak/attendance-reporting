@@ -2,8 +2,6 @@
 utils/database.py
 ─────────────────
 All database I/O via Supabase (PostgreSQL).
-Replaces gsheets.py entirely — function signatures are identical
-so the rest of the app needs only an import path change.
 
 Supabase tables:
     users           – id | name | pin | role | email | base_salary |
@@ -11,7 +9,12 @@ Supabase tables:
 
     attendance      – id | name | date | company | in_time | out_time |
                       in_latitude | in_longitude | out_latitude |
-                      out_longitude | created_at
+                      out_longitude | source | status | created_at
+
+                      source: "in-office" | "out-office"
+                      status: eTimeTrackLite status for in-office rows
+                              (Present, WeeklyOff, ½Present, Absent, etc.)
+                              "Present" for all out-office rows
 
     salary_ledger   – id | employee | month | b_forward | cl_pl |
                       sunday_c_off | leave_availed | add_substract |
@@ -23,14 +26,14 @@ Supabase tables:
                       recipient_amount | bank | saved_at
 
 Roles:
-    partner   – full access, can set salaries, can add any role
-    admin     – reports + ledger, can add employees/articles only
-    employee  – attendance only
-    article   – attendance only, fixed holiday bank, no monthly CL/PL
+    partner   – full access, salary processing, attendance check-in
+    admin     – attendance report upload, manage users, salary ledger view
+    employee  – attendance check-in + payslip
+    article   – attendance check-in + payslip, fixed holiday bank, no CL/PL
 
 Flags per user:
-    process_salary    – appears in salary processing if True
-    track_attendance  – appears in attendance login if True
+    process_salary    – appears in salary processing dropdown if True
+    track_attendance  – appears in attendance login dropdown if True
 """
 
 from __future__ import annotations
@@ -44,7 +47,6 @@ from supabase import create_client, Client
 # ── IST timezone ──────────────────────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Client
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,7 +56,6 @@ def _get_client() -> Client:
     url = st.secrets["supabase"]["url"]
     key = st.secrets["supabase"]["key"]
     return create_client(url, key)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Users
@@ -93,10 +94,10 @@ def fetch_user_by_name(name: str) -> dict | None:
 def add_user(
     name: str,
     pin: str,
-    role: str             = "employee",
-    email: str            = "",
-    base_salary: float    = 0.0,
-    process_salary: bool  = True,
+    role: str              = "employee",
+    email: str             = "",
+    base_salary: float     = 0.0,
+    process_salary: bool   = True,
     track_attendance: bool = True,
 ) -> dict:
     """
@@ -178,10 +179,9 @@ def verify_associate(name: str, pin: str) -> bool:
 def verify_admin(username: str, password: str) -> bool:
     """
     Verify admin or partner login.
-    Checks secrets.toml fallback first, then users table.
+    Checks secrets.toml fallback first, then users table (PIN as password).
     """
     try:
-        # Hardcoded fallback from secrets
         try:
             if (
                 username.strip() == st.secrets["admin"]["username"]
@@ -191,7 +191,6 @@ def verify_admin(username: str, password: str) -> bool:
         except Exception:
             pass
 
-        # Check users table — role must be admin or partner
         client = _get_client()
         res    = client.table("users") \
                        .select("pin, role") \
@@ -252,9 +251,8 @@ def fetch_all_employee_names() -> list[str]:
     except Exception:
         return []
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Attendance
+# Attendance — out-office (real-time check-in / check-out)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def mark_attendance(
@@ -264,7 +262,7 @@ def mark_attendance(
     longitude: float,
 ) -> dict:
     """
-    Insert a new check-in row.
+    Insert a new out-office check-in row.
     Blocks if there is an open entry (checked in, not yet out).
     Returns {"success": bool, "message": str}.
     """
@@ -278,6 +276,7 @@ def mark_attendance(
                          .select("id") \
                          .ilike("name", name.strip()) \
                          .eq("date", today) \
+                         .eq("source", "out-office") \
                          .is_("out_time", "null") \
                          .execute()
 
@@ -295,6 +294,8 @@ def mark_attendance(
             "out_time"    : None,
             "in_latitude" : latitude,
             "in_longitude": longitude,
+            "source"      : "out-office",
+            "status"      : "Present",
         }).execute()
 
         return {"success": True, "message": f"✅ Checked in at {now}."}
@@ -308,7 +309,7 @@ def mark_checkout(
     longitude: float,
 ) -> dict:
     """
-    Update the open check-in row with out_time and checkout coordinates.
+    Update the open out-office check-in row with out_time and coordinates.
     Returns {"success": bool, "message": str}.
     """
     today = datetime.now(IST).date().isoformat()
@@ -316,11 +317,11 @@ def mark_checkout(
     try:
         client = _get_client()
 
-        # Find open entry by id
         open_entry = client.table("attendance") \
                            .select("id") \
                            .ilike("name", name.strip()) \
                            .eq("date", today) \
+                           .eq("source", "out-office") \
                            .is_("out_time", "null") \
                            .execute()
 
@@ -348,7 +349,7 @@ def mark_checkout(
 
 def get_today_status(name: str) -> dict:
     """
-    Return today's attendance state for a user.
+    Return today's attendance state for an out-office user.
     state: "none" | "checked_in" | "checked_out"
     Also returns trip count, last in/out times, and company.
     """
@@ -359,17 +360,12 @@ def get_today_status(name: str) -> dict:
                        .select("*") \
                        .ilike("name", name.strip()) \
                        .eq("date", today) \
+                       .eq("source", "out-office") \
                        .order("id", desc=False) \
                        .execute()
 
         if not res.data:
-            return {
-                "state"   : "none",
-                "in_time" : "",
-                "out_time": "",
-                "company" : "",
-                "trips"   : 0,
-            }
+            return {"state": "none", "in_time": "", "out_time": "", "company": "", "trips": 0}
 
         rows            = res.data
         completed_trips = sum(1 for r in rows if r.get("out_time"))
@@ -393,20 +389,106 @@ def get_today_status(name: str) -> dict:
                 "trips"   : completed_trips,
             }
     except Exception:
-        return {
-            "state"   : "none",
-            "in_time" : "",
-            "out_time": "",
-            "company" : "",
-            "trips"   : 0,
-        }
+        return {"state": "none", "in_time": "", "out_time": "", "company": "", "trips": 0}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Attendance — in-office (admin XLS upload → saved to Supabase)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:
+def save_in_office_attendance(rows: list[dict]) -> dict:
     """
-    Fetch attendance rows optionally filtered by month (YYYY-MM).
-    Returns a DataFrame with capitalised column names to match
-    the rest of the app's expectations.
+    Insert in-office attendance rows parsed from the master XLS.
+    Each row must have: name, date, in_time, out_time, status.
+
+    Deduplication: skips any row where (name, date, source="in-office")
+    already exists in the table to prevent double-saving on re-upload.
+
+    Returns {"success": bool, "inserted": int, "skipped": int, "message": str}.
+    """
+    if not rows:
+        return {"success": True, "inserted": 0, "skipped": 0, "message": "No rows to save."}
+
+    try:
+        client = _get_client()
+
+        # Fetch all existing in-office rows for the months covered by this upload
+        # to build a dedup set without per-row queries
+        dates = {r["date"] for r in rows}
+        min_date = min(dates)
+        max_date = max(dates)
+
+        existing_res = client.table("attendance") \
+                             .select("name, date") \
+                             .eq("source", "in-office") \
+                             .gte("date", min_date) \
+                             .lte("date", max_date) \
+                             .execute()
+
+        existing_set: set[tuple[str, str]] = set()
+        if existing_res.data:
+            for r in existing_res.data:
+                existing_set.add((
+                    str(r["name"]).strip().lower(),
+                    str(r["date"]).strip(),
+                ))
+
+        to_insert = []
+        skipped   = 0
+
+        for row in rows:
+            key = (str(row["name"]).strip().lower(), str(row["date"]).strip())
+            if key in existing_set:
+                skipped += 1
+                continue
+            to_insert.append({
+                "name"    : str(row["name"]).strip(),
+                "date"    : str(row["date"]).strip(),
+                "company" : "",
+                "in_time" : str(row.get("in_time",  "") or ""),
+                "out_time": str(row.get("out_time", "") or ""),
+                "in_latitude"  : None,
+                "in_longitude" : None,
+                "out_latitude" : None,
+                "out_longitude": None,
+                "source"  : "in-office",
+                "status"  : str(row.get("status", "Present")).strip(),
+            })
+
+        if to_insert:
+            # Insert in batches of 500 to stay within Supabase limits
+            batch_size = 500
+            for i in range(0, len(to_insert), batch_size):
+                client.table("attendance").insert(to_insert[i:i + batch_size]).execute()
+
+        inserted = len(to_insert)
+        msg = f"✅ Saved {inserted} row(s) to Supabase."
+        if skipped:
+            msg += f" {skipped} row(s) skipped (already exist)."
+
+        return {"success": True, "inserted": inserted, "skipped": skipped, "message": msg}
+
+    except Exception as e:
+        return {"success": False, "inserted": 0, "skipped": 0, "message": f"Error saving attendance: {e}"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attendance — fetch (used by report generation + salary processing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_attendance(
+    month: str | None = None,
+    source: str | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch attendance rows from Supabase.
+
+    Args:
+        month:  filter to YYYY-MM (optional)
+        source: "in-office" | "out-office" | None (both)
+
+    Returns DataFrame with columns:
+        Name | Date | Company | InTime | OutTime |
+        In_Latitude | In_Longitude | Out_Latitude | Out_Longitude |
+        Source | Status
     """
     try:
         import calendar as _calendar
@@ -419,14 +501,16 @@ def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:
             query     = query.gte("date", f"{month}-01") \
                              .lte("date", f"{month}-{last_day:02d}")
 
-        res = query.order("date").execute()
+        if source:
+            query = query.eq("source", source)
+
+        res = query.order("date").order("name").execute()
 
         if not res.data:
             return pd.DataFrame(columns=[
-                "Name", "Date", "Company",
-                "InTime", "OutTime",
-                "In_Latitude", "In_Longitude",
-                "Out_Latitude", "Out_Longitude",
+                "Name", "Date", "Company", "InTime", "OutTime",
+                "In_Latitude", "In_Longitude", "Out_Latitude", "Out_Longitude",
+                "Source", "Status",
             ])
 
         df = pd.DataFrame(res.data).rename(columns={
@@ -439,6 +523,8 @@ def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:
             "in_longitude" : "In_Longitude",
             "out_latitude" : "Out_Latitude",
             "out_longitude": "Out_Longitude",
+            "source"       : "Source",
+            "status"       : "Status",
         })
 
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -448,6 +534,13 @@ def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:
         st.error(f"Could not fetch attendance: {e}")
         return pd.DataFrame()
 
+
+def fetch_out_office_attendance(month: str | None = None) -> pd.DataFrame:
+    """
+    Convenience wrapper — fetch out-office rows only.
+    Kept for backward compatibility with any future callers.
+    """
+    return fetch_attendance(month=month, source="out-office")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Salary Ledger
@@ -473,7 +566,7 @@ def fetch_salary_ledger(employee: str | None = None) -> pd.DataFrame:
 
 def fetch_carry_forward(employee: str, month: str) -> float:
     """
-    Return C_Forward from the most recent saved ledger month
+    Return c_forward from the most recent saved ledger month
     strictly before the given month (YYYY-MM).
     Returns 0.0 if no prior record exists.
     """
@@ -556,13 +649,9 @@ def save_salary_ledger_row(
             "is_study_leave": is_study_leave,
             "saved_at"      : saved_at,
         }).execute()
-        return {
-            "success": True,
-            "message": f"✅ Ledger saved for {employee} — {month}.",
-        }
+        return {"success": True, "message": f"✅ Ledger saved for {employee} — {month}."}
     except Exception as e:
         return {"success": False, "message": f"Error saving ledger: {e}"}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Salary Splits
@@ -571,11 +660,10 @@ def save_salary_ledger_row(
 def save_salary_splits(
     employee: str,
     month: str,
-    splits: list[dict],   # [{"name": str, "amount": float, "bank": str}, ...]
+    splits: list[dict],
 ) -> dict:
     """
     Insert one row per split recipient into salary_splits.
-    Each split carries its own bank account.
     Returns {"success": bool, "message": str}.
     """
     if not splits:
@@ -601,9 +689,7 @@ def save_salary_splits(
 
 
 def fetch_salary_splits(employee: str, month: str) -> pd.DataFrame:
-    """
-    Fetch salary splits for a given employee and month.
-    """
+    """Fetch salary splits for a given employee and month."""
     try:
         client = _get_client()
         res    = client.table("salary_splits") \

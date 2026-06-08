@@ -6,9 +6,10 @@ Entry point for the Attendance & Salary Streamlit application.
 Run with:
     streamlit run app.py
 
-The app routes to one of two modules based on which login tab is used:
-  • Associate Login  →  Module 1: Out-Office Attendance
-  • Admin Login      →  Module 2: Salary Processing & Reports
+Role routing:
+    employee / article  →  Attendance check-in + payslip only
+    partner             →  Attendance check-in + Admin panel (all pages incl. Salary Processing)
+    admin               →  Admin panel only (Attendance Report, Manage Users, Salary Ledger)
 """
 
 import streamlit as st
@@ -16,8 +17,6 @@ from utils.auth import init_session
 from modules.attendance import show_attendance_module
 from modules.admin import show_admin_module
 
-
-# ── Page config (must be the very first Streamlit call) ──────────────────────
 st.set_page_config(
     page_title="Attendance System",
     page_icon="📋",
@@ -25,14 +24,10 @@ st.set_page_config(
     initial_sidebar_state="auto",
 )
 
-
-# ── Minimal global CSS ────────────────────────────────────────────────────────
 st.markdown(
     """
     <style>
-        /* Slightly larger base font for readability on mobile */
         html, body, [class*="css"] { font-size: 16px; }
-        /* Remove Streamlit's default hamburger menu */
         #MainMenu { visibility: hidden; }
         footer    { visibility: hidden; }
     </style>
@@ -42,40 +37,36 @@ st.markdown(
 
 
 def main():
-
     init_session()
 
-    if st.session_state.logged_in:
-        role = st.session_state.user_role
-
-        if role in ["employee", "article"]:
-            # Attendance only — no admin panel at all
-            show_attendance_module()
-
-        elif role in ["admin", "partner"]:
-            # Show both attendance and admin via sidebar
-            _show_authenticated_layout()
-    else:
+    if not st.session_state.logged_in:
         _show_landing()
+        return
 
-
-        
-def _show_authenticated_layout():
-    """
-    Authenticated layout for admin and partner.
-    Sidebar lets them switch between attendance and admin panel.
-    """
     role = st.session_state.user_role
-    name = st.session_state.user_name
 
+    if role in ("employee", "article"):
+        show_attendance_module()
+
+    elif role == "partner":
+        _show_partner_layout()
+
+    elif role == "admin":
+        show_admin_module()
+
+
+def _show_partner_layout():
+    """
+    Partner sees two top-level sections in the sidebar:
+      📍 My Attendance  →  check-in / check-out (same as employee)
+      🔧 Admin Panel    →  all admin pages + salary processing
+    """
+    name = st.session_state.user_name
     st.sidebar.title(f"👋 {name}")
-    st.sidebar.caption(f"Role: {role.capitalize()}")
+    st.sidebar.caption("Role: Partner")
     st.sidebar.markdown("---")
 
-    section = st.sidebar.radio(
-        "Module",
-        ["📍 My Attendance", "🔧 Admin Panel"],
-    )
+    section = st.sidebar.radio("Module", ["📍 My Attendance", "🔧 Admin Panel"])
 
     if section == "📍 My Attendance":
         show_attendance_module()
@@ -83,20 +74,22 @@ def _show_authenticated_layout():
         show_admin_module()
 
 
-
 def _show_landing():
+    """
+    Landing page for unauthenticated users.
+    Tab 1: employee / article / partner login → attendance check-in
+    Tab 2: admin / partner login → admin panel
+    """
     st.title("📋 Attendance System")
-    st.caption("Out-Office Attendance Tracking Management")
+    st.caption("Out-Office Attendance & Salary Management")
     st.markdown("---")
 
-    tab1, tab2 = st.tabs(["👤  Users — Mark Attendance", "🔐  Admin"])
+    tab1, tab2 = st.tabs(["👤  Mark Attendance", "🔐  Admin"])
 
     with tab1:
-        # Delegates to the attendance module's login section
         show_attendance_module()
 
     with tab2:
-        # Delegates to the admin module's login section
         show_admin_module()
 
 
