@@ -361,9 +361,14 @@ def _auto_sunday_c_off(df: pd.DataFrame, extra_adjustment: float = 0.0) -> float
 
 
 def _calculate_salary(
-    b_forward: float, cl_pl: float, sunday_c_off: float,
-    leave_availed: float, base_salary: float,
-    days_in_month: int, is_study_leave: bool,
+    b_forward: float,
+    cl_pl: float,
+    sunday_c_off: float,
+    leave_availed: float,
+    base_salary: float,
+    days_in_month: int,
+    is_study_leave: bool,
+    is_article: bool = False
 ) -> dict:
     if is_study_leave:
         return {
@@ -371,14 +376,19 @@ def _calculate_salary(
             "leave_availed": 0.0, "add_subtract": b_forward,
             "c_forward": b_forward, "deduction": 0.0, "salary_paid": 0.0,
         }
-    add_subtract = b_forward + cl_pl + sunday_c_off - leave_availed
-    if add_subtract >= 0:
-        return {
-            "b_forward": b_forward, "cl_pl": cl_pl, "sunday_c_off": sunday_c_off,
-            "leave_availed": leave_availed, "add_subtract": add_subtract,
-            "c_forward": add_subtract, "deduction": 0.0, "salary_paid": base_salary,
-        }
-    deduction = (base_salary / days_in_month) * abs(add_subtract)
+    
+    effective_cl_pl = 0.0 if is_article else cl_pl
+    add_substract = b_forward + effective_cl_pl + sunday_c_off - leave_availed
+
+    if add_substract >= 0:
+        c_forward   = add_substract
+        deduction   = 0.0
+        salary_paid = base_salary
+    else:
+        c_forward   = 0.0
+        deduction   = (base_salary / days_in_month) * abs(add_substract)
+        salary_paid = base_salary - deduction
+
     return {
         "b_forward": b_forward, "cl_pl": cl_pl, "sunday_c_off": sunday_c_off,
         "leave_availed": leave_availed, "add_subtract": add_subtract,
@@ -1189,7 +1199,7 @@ def _show_salary_processing():
         try:
             bank_options = list(st.secrets["banks"]["accounts"])
         except Exception:
-            bank_options = ["FF/JSB", "M&RFSPL/UBI", "PTBS/UBI", "MCH", "AUSM/HDFC"]
+            bank_options = ["FF/JSB", "M&RFSPL/UBI", "PTBS/UBI", "MCHLLP/KOTAK", "MCHLLP/HDFC", "AUSM/HDFC", "MAJMUDAR", "OWFSPL/UBI", "FAPL/UBI", "VSPL/UBI", "MCO/KOTAK"]
         bank = st.selectbox("Pay From (Entity/Bank)", options=bank_options, key="sal_bank")
 
     st.markdown("---")
@@ -1200,23 +1210,14 @@ def _show_salary_processing():
 
     if base_salary > 0:
         result = _calculate_salary(
-            b_forward=b_forward, cl_pl=cl_pl_value, sunday_c_off=sunday_c_off_final,
-            leave_availed=leave_availed, base_salary=base_salary,
-            days_in_month=days_in_month, is_study_leave=is_study_leave,
-        )
-        st.dataframe(
-            pd.DataFrame({
-                "Field": ["B/Forward (in)", "CL/PL Eligible", "Sunday/C Off",
-                          "Leave Availed", "ADD/SUBSTRACT", "C/Forward (out)",
-                          "Base Salary", "Deduction", "Salary Paid"],
-                "Value": [
-                    f"{result['b_forward']:.1f} days", f"{result['cl_pl']:.1f} days",
-                    f"{result['sunday_c_off']:.1f} days", f"{result['leave_availed']:.1f} days",
-                    f"{result['add_subtract']:.1f} days", f"{result['c_forward']:.1f} days",
-                    f"₹{base_salary:,.2f}", f"₹{result['deduction']:,.2f}", f"₹{result['salary_paid']:,.2f}",
-                ],
-            }),
-            use_container_width=True, hide_index=True,
+            b_forward      = b_forward,
+            cl_pl          = 0.0 if is_study_leave else cl_pl,
+            sunday_c_off   = sunday_c_off_final,
+            leave_availed  = leave_availed,
+            base_salary    = base_salary,
+            days_in_month  = days_in_month,
+            is_study_leave = is_study_leave,
+            is_article = is_article
         )
         if is_study_leave:
             st.info("📚 Study Leave — no salary paid. Balance carries through.")
@@ -1263,13 +1264,19 @@ def _show_salary_processing():
                 rec_name = st.text_input(f"n{i}", key=f"sp_name_{i}",
                                          label_visibility="collapsed", placeholder=f"Recipient {i+1}")
             with rc[1]:
-                rec_amount = st.number_input(f"a{i}", key=f"sp_amt_{i}",
-                                             label_visibility="collapsed", min_value=0.0,
-                                             step=100.0, format="%.2f")
+                rec_amount = st.number_input(
+                    f"a{i}", key=f"sp_amt_{i}",
+                    label_visibility="collapsed",
+                    min_value=0.0, step=100.0, format="%.2f",
+                )
             with rc[2]:
-                rec_bank = st.selectbox(f"b{i}", key=f"sp_bank_{i}",
-                                        options=bank_options, label_visibility="collapsed")
-            splits.append({"name": rec_name, "amount": rec_amount, "bank": rec_bank})
+                rec_bank = st.selectbox(
+                    f"b{i}", key=f"sp_bank_{i}",
+                    options=bank_options,
+                    label_visibility="collapsed",
+                )
+
+            splits.append({"name": rec_name, "amount": rec_amount, "bank":rec_bank})
             running_total += rec_amount
 
         if base_salary > 0 and st.session_state.sal_calc_result:
@@ -1393,4 +1400,4 @@ def _show_user_management():
                                 res = update_user_salary(row["name"], new_sal)
                                 st.success(res["message"]) if res["success"] else st.error(res["message"])
     except Exception as e:
-        st.error(f"Could not load users: {e}")
+        st.error(f"Could not load users: {e}")  
